@@ -1,11 +1,11 @@
-# 🏢 105 Numara — Bina Yönetim Sistemi
+# 🏢 Mert Apartmanı No 105 — Yönetim Sistemi
 
 React + Vite + Firebase (Auth & Firestore) ile yapılmış apartman yönetim uygulaması.
 
 ## Özellikler
 - Yönetici ve daire sakini girişi (Firebase Authentication)
-- Aidat takibi (ay bazlı), gelir / gider kayıtları, grafikli özet
-- Duyuru ve mesaj yönetimi, denetim logu
+- Aidat takibi (aya özel tutar), tek sayfada gelir–gider, borç / eksik ödeme takibi
+- Daire bazlı PDF raporu, sakin geçmişi, denetim logu
 - 12 saat hareketsizlikte otomatik çıkış
 
 ## Giriş
@@ -26,7 +26,7 @@ npm run dev
 
 ## Firebase kontrol listesi
 - Authentication → Sign-in method → **Email/Password** etkin olmalı.
-- Firestore Database oluşturulmuş olmalı; Rules, giriş yapmış kullanıcıların `ayarlar`, `daireler`, `odemeler`, `duyurular` okumasına; yönetici hesabının tüm koleksiyonlara yazmasına izin vermeli.
+- Firestore Database oluşturulmuş olmalı; Rules, giriş yapmış kullanıcıların `ayarlar`, `daireler`, `odemeler`, `borclar` okumasına; yönetici hesabının tüm koleksiyonlara yazmasına izin vermeli.
 - Authentication → Settings → Authorized domains listesinde Vercel alan adınız (`xxx.vercel.app`) bulunsun.
 
 ## Yapı
