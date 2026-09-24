@@ -34,6 +34,17 @@ const bugun  = () => new Date(Date.now() - new Date().getTimezoneOffset() * 6000
 const topla  = l => l.reduce((a, k) => a + (k.tutar || 0), 0);
 const ayOf   = t => (t || "").slice(0, 7);
 const ayAdi  = key => { if (!key) return "Tarihsiz"; const [y, m] = key.split("-"); return `${MONTH_NAMES[Number(m) - 1] || m} ${y}`; };
+// Aidat geliri, ödemenin yapıldığı tarihe değil ait olduğu aya (dönem) bağlanır.
+// Eski kayıtlarda dönem alanı yoksa nottaki "Mayıs 2026 aidatı" ifadesinden bulunur.
+const AY_REGEX = new RegExp(`(${MONTH_NAMES.join("|")}) (\\d{4}) aidat`);
+const gelirAy = g => {
+  if (g.kaynak === "aidat") {
+    if (g.donem) return g.donem;
+    const m = (g.not || "").match(AY_REGEX);
+    if (m) return `${m[2]}-${String(MONTH_NAMES.indexOf(m[1]) + 1).padStart(2, "0")}`;
+  }
+  return ayOf(g.tarih);
+};
 const DURUM_STIL = {
   odendi:  { background:"#D1FAE5", color:"#065F46" },
   bekliyor:{ background:"#FEF3C7", color:"#92400E" },
@@ -393,6 +404,18 @@ function TabAidat({ daireler, ayarlar }) {
     const hedef = (uygula ? AYLAR.slice(idx) : [ay]).map(a=>a.key);
     await setDoc(doc(db,"ayarlar","genel"), { aylikAidat:Object.fromEntries(hedef.map(k=>[k,v])) }, { merge:true });
     logAction(`${ad} aidat tutarı: ₺${v}${uygula?" (sonraki aylar dahil)":""}`, "aidat_update");
+    // Eski tutarla ödenmiş kayıtlar varsa, tek seferde yeni tutara çek
+    const eksikBul = o => borclar.filter(b=>b.daire===o.daire && b.donem===o.donem).reduce((a,b)=>a+(b.eksik||0),0);
+    const eski = odemeler.filter(o=>o.durum==="odendi" && hedef.includes(o.donem))
+      .map(o=>({ o, yeni:Math.max(0, v - eksikBul(o)) })).filter(x=>x.yeni !== x.o.tutar);
+    if (eski.length && window.confirm(`${eski.length} ödenmiş kayıt eski tutarda görünüyor. Yeni tutara (₺${fmt(v)}) göre güncellensin mi?`)) {
+      for (const { o, yeni } of eski) {
+        await updateDoc(doc(db,"odemeler",o.id), { tutar:yeni });
+        const g = await aidatBul(o.daire, o.donem, o.donemAd || ayAdi(o.donem));
+        if (g) await updateDoc(doc(db,"gelirler",g.id), { tutar:yeni });
+      }
+      logAction(`${eski.length} ödenmiş aidat kaydı ₺${v} üzerinden güncellendi`, "aidat_update");
+    }
     alert("Kaydedildi.");
   }
 
@@ -520,10 +543,10 @@ function TabGelirGider() {
   const gelirler = useCol("gelirler","tarih"), giderler = useCol("giderler","tarih");
   const cur = curKey();
   const [ay,setAy] = useState(cur);
-  const keys = [...new Set([cur, ...gelirler.map(k=>ayOf(k.tarih)), ...giderler.map(k=>ayOf(k.tarih))])].filter(Boolean).sort().reverse();
+  const keys = [...new Set([cur, ...gelirler.map(gelirAy), ...giderler.map(k=>ayOf(k.tarih))])].filter(Boolean).sort().reverse();
   const sec = ay==="tumu" || keys.includes(ay) ? ay : "tumu";
-  const f = l => sec==="tumu" ? l : l.filter(k=>ayOf(k.tarih)===sec);
-  const gel = f(gelirler), gid = f(giderler), net = topla(gel) - topla(gid);
+  const f = (l,fn) => sec==="tumu" ? l : l.filter(k=>fn(k)===sec);
+  const gel = f(gelirler,gelirAy), gid = f(giderler,k=>ayOf(k.tarih)), net = topla(gel) - topla(gid);
   return (
     <div>
       <div style={{ display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginBottom:14 }}>
@@ -637,12 +660,12 @@ function TabRapor({ daireler }) {
   const mKey = m => `${yil}-${String(m+1).padStart(2,"0")}`;
   const bas = ay==="tumu" ? mKey(0) : mKey(ay), son = ay==="tumu" ? mKey(11) : mKey(ay);
   const inP = key => key >= bas && key <= son;
-  const yillar = [...new Set([CUR_YEAR, ...[...gelirler,...giderler].map(k=>Number(ayOf(k.tarih).slice(0,4))).filter(Boolean)])].sort((a,b)=>b-a);
-  const gel = gelirler.filter(k=>inP(ayOf(k.tarih))), gid = giderler.filter(k=>inP(ayOf(k.tarih)));
+  const yillar = [...new Set([CUR_YEAR, ...[...gelirler.map(gelirAy),...giderler.map(k=>ayOf(k.tarih))].map(k=>Number(k.slice(0,4))).filter(Boolean)])].sort((a,b)=>b-a);
+  const gel = gelirler.filter(k=>inP(gelirAy(k))), gid = giderler.filter(k=>inP(ayOf(k.tarih)));
   const tG = topla(gel), tD = topla(gid), net = tG - tD;
   const donem = ay==="tumu" ? `${yil} yılı` : `${MONTH_NAMES[ay]} ${yil}`;
   const aylik = MONTH_NAMES.map((ad,m)=>({ m, ad,
-    g:topla(gelirler.filter(k=>ayOf(k.tarih)===mKey(m))), d:topla(giderler.filter(k=>ayOf(k.tarih)===mKey(m))) })).filter(r=>r.g||r.d);
+    g:topla(gelirler.filter(k=>gelirAy(k)===mKey(m))), d:topla(giderler.filter(k=>ayOf(k.tarih)===mKey(m))) })).filter(r=>r.g||r.d);
   const daireRows = daireler.map(d=>{
     const aidatOd = odemeler.filter(o=>o.daire===d.id && o.durum==="odendi" && inP(o.donem));
     const tahs = gelirler.filter(g=>g.daire===d.id && g.kaynak==="borç tahsilatı" && inP(ayOf(g.tarih)));
