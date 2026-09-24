@@ -37,7 +37,8 @@
       .no-print, .desktop-nav, .mobile-nav { display: none !important; }
       .print-only { display: block !important; }
       body { background:#fff; font-size:11px; }
-      .rapor * { box-shadow: none !important; }
+      .rapor, .rapor * { box-shadow: none !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      .rapor svg, .rapor .two-col > div { break-inside: avoid; }
       .rapor table { font-size: 10px; }
       .rapor tr { page-break-inside: avoid; }
       .rapor > div { break-inside: auto; }
