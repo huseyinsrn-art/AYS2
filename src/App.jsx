@@ -45,6 +45,9 @@ const gelirAy = g => {
   }
   return ayOf(g.tarih);
 };
+// Alacak (eksik ödeme): yalnızca açık olanlar kasadan düşülür; eski düzendekiler (model≠2) ayrı ele alınır
+const kalanOf  = b => b.model === 2 ? (b.kapali ? 0 : (b.eksik || 0)) : Math.max(0, (b.eksik || 0) - (b.odenen || 0));
+const acikTutar = b => b.model === 2 && !b.kapali ? (b.eksik || 0) : 0;
 const DURUM_STIL = {
   odendi:  { background:"#D1FAE5", color:"#065F46" },
   bekliyor:{ background:"#FEF3C7", color:"#92400E" },
@@ -329,15 +332,15 @@ function TabOzet({ daireler, ayarlar }) {
   const cur = curKey(), aidat = aidatOf(ayarlar, cur);
   const odenenSet = new Set(odemeler.filter(o=>o.durum==="odendi").map(o=>`${o.daire}|${o.donem}`));
   const buAy = odemeler.filter(o=>o.donem===cur && o.durum==="odendi");
-  const tahsilat = topla(buAy), beklenen = daireler.length * aidat;
+  const tahsilat = topla(buAy) - borclar.filter(b=>b.donem===cur).reduce((a,b)=>a+acikTutar(b),0), beklenen = daireler.length * aidat;
   const yuzde = beklenen ? Math.min(100, Math.round(tahsilat / beklenen * 100)) : 0;
   const gecmis = gecmisAylar().map(a=>a.key).filter(k=>k<cur);
   const geciken = daireler.map(d=>{
     const aylar = gecmis.filter(k=>!odenenSet.has(`${d.id}|${k}`));
     return { d, aylar, tutar:aylar.reduce((a,k)=>a+aidatOf(ayarlar,k),0) };
   }).filter(x=>x.aylar.length);
-  const acikBorc = borclar.reduce((a,b)=>a+Math.max(0,(b.eksik||0)-(b.odenen||0)),0);
-  const kasa = topla(gelirler) - topla(giderler);
+  const acikBorc = borclar.reduce((a,b)=>a+kalanOf(b),0);
+  const kasa = topla(gelirler) - topla(giderler) - borclar.reduce((a,b)=>a+acikTutar(b),0);
   const son = [...gelirler.map(g=>({...g,t:"g"})), ...giderler.map(g=>({...g,t:"d"}))]
     .sort((a,b)=>(b.tarih||"").localeCompare(a.tarih||"")).slice(0,6);
   return (
@@ -346,7 +349,7 @@ function TabOzet({ daireler, ayarlar }) {
         <MetricCard label="Bu Ay Tahsilat" val={`₺${fmt(tahsilat)}`} color="#1D9E75" sub={`%${yuzde} · ${buAy.length}/${daireler.length} daire`}/>
         <MetricCard label="Kalan Tahsilat" val={`₺${fmt(Math.max(0,beklenen-tahsilat))}`} color="#BA7517" sub={`Hedef ₺${fmt(beklenen)}`}/>
         <MetricCard label="Geciken" val={`${geciken.length} daire`} color={geciken.length?"#D85A30":"#1D9E75"} sub={`₺${fmt(geciken.reduce((a,x)=>a+x.tutar,0))}`}/>
-        <MetricCard label="Kasa" val={`₺${fmt(kasa)}`} color={kasa>=0?"#1D9E75":"#D85A30"} sub={acikBorc?`Açık borç ₺${fmt(acikBorc)}`:"Açık borç yok"}/>
+        <MetricCard label="Kasa" val={`₺${fmt(kasa)}`} color={kasa>=0?"#1D9E75":"#D85A30"} sub={acikBorc?`Açık alacak ₺${fmt(acikBorc)} düşüldü`:"Açık alacak yok"}/>
       </div>
       <div style={S.card}>
         <div style={S.cardTitle}>{ayAdi(cur)} · Aidat ₺{fmt(aidat)}</div>
@@ -393,7 +396,7 @@ function TabAidat({ daireler, ayarlar }) {
   useEffect(()=>{ setTutarStr(String(aidat)); setUygula(false); }, [key, aidat]);
 
   const om = Object.fromEntries(odemeler.filter(o=>o.donem===key && o.durum==="odendi").map(o=>[o.daire,o]));
-  const eksikOf = id => borclar.filter(b=>b.daire===id && b.donem===key).reduce((a,b)=>a+(b.eksik||0),0);
+  const eksikOf = id => borclar.filter(b=>b.daire===id && b.donem===key).reduce((a,b)=>a+acikTutar(b),0);
   const durumOf = d => om[d.id] ? "odendi" : (key < cur ? "gecikti" : "bekliyor");
   const rows = daireler.map(d=>({ ...d, durum:durumOf(d) })).filter(d=>filtre==="tumu" || d.durum===filtre);
   const say = dr => daireler.filter(d=>durumOf(d)===dr).length;
@@ -405,9 +408,8 @@ function TabAidat({ daireler, ayarlar }) {
     await setDoc(doc(db,"ayarlar","genel"), { aylikAidat:Object.fromEntries(hedef.map(k=>[k,v])) }, { merge:true });
     logAction(`${ad} aidat tutarı: ₺${v}${uygula?" (sonraki aylar dahil)":""}`, "aidat_update");
     // Eski tutarla ödenmiş kayıtlar varsa, tek seferde yeni tutara çek
-    const eksikBul = o => borclar.filter(b=>b.daire===o.daire && b.donem===o.donem).reduce((a,b)=>a+(b.eksik||0),0);
     const eski = odemeler.filter(o=>o.durum==="odendi" && hedef.includes(o.donem))
-      .map(o=>({ o, yeni:Math.max(0, v - eksikBul(o)) })).filter(x=>x.yeni !== x.o.tutar);
+      .map(o=>({ o, yeni:v })).filter(x=>x.yeni !== x.o.tutar);
     if (eski.length && window.confirm(`${eski.length} ödenmiş kayıt eski tutarda görünüyor. Yeni tutara (₺${fmt(v)}) göre güncellensin mi?`)) {
       for (const { o, yeni } of eski) {
         await updateDoc(doc(db,"odemeler",o.id), { tutar:yeni });
@@ -430,7 +432,7 @@ function TabAidat({ daireler, ayarlar }) {
         if (gelir) await deleteDoc(doc(db,"gelirler",gelir.id));
         logAction(`${d.id} ${ad} ödeme iptal`, "odeme_cancel");
       } else {
-        const tutar = Math.max(0, aidat - eksikOf(d.id)), sakin = sakinAdi(d, key);
+        const tutar = aidat, sakin = sakinAdi(d, key);
         const ref = await addDoc(collection(db,"odemeler"), { daire:d.id, donem:key, donemAd:ad, tutar, durum:"odendi", tarih:bugun(), sakinAd:sakin, olusturuldu:serverTimestamp() });
         await addDoc(collection(db,"gelirler"), { kaynak:"aidat", daire:d.id, donem:key, odemeId:ref.id, tutar, tarih:bugun(), not:`${d.id} ${sakin} - ${ad} aidatı`, otomatik:true, olusturuldu:serverTimestamp() });
         logAction(`${d.id} ${ad} ödeme kaydı`, "odeme_record");
@@ -471,7 +473,7 @@ function TabAidat({ daireler, ayarlar }) {
                   <tr key={d.id}>
                     <td style={S.td}><b>{d.id}</b></td>
                     <td style={S.td}>{sakinAdi(d,key)}</td>
-                    <td style={S.td}>₺{fmt(om[d.id]?om[d.id].tutar:aidat)}{eksikOf(d.id)>0 && <div style={{ fontSize:10,color:"#D85A30" }}>eksik ₺{fmt(eksikOf(d.id))}</div>}</td>
+                    <td style={S.td}>₺{fmt(om[d.id]?om[d.id].tutar:aidat)}{eksikOf(d.id)>0 && <div style={{ fontSize:10,color:"#D85A30" }}>alacak ₺{fmt(eksikOf(d.id))}</div>}</td>
                     <td style={S.td}>{om[d.id]?.tarih||"—"}</td>
                     <td style={S.td}><span style={{ ...S.badge,...DURUM_STIL[d.durum] }}>{DURUM_LABEL[d.durum]}</span></td>
                     <td style={S.td}>
@@ -496,6 +498,7 @@ function Kolon({ baslik, koleksiyon, alan, secenekler, liste, renk, isaret, ay }
   const [goster,setGoster] = useState(false);
   const [form,setForm] = useState(bos());
   const set = (k,v) => setForm(p=>({ ...p,[k]:v }));
+  const btn = koleksiyon==="giderler" ? { background:"linear-gradient(135deg,#E5484D,#C7332F)", boxShadow:"0 2px 8px rgba(229,72,77,.3)" } : {};
   async function ekle() {
     if (!form.tutar) return;
     await addDoc(collection(db,koleksiyon), { ...form, tutar:Number(form.tutar), olusturuldu:serverTimestamp() });
@@ -513,14 +516,14 @@ function Kolon({ baslik, koleksiyon, alan, secenekler, liste, renk, isaret, ay }
         <div style={S.cardTitle}>{baslik}</div>
         <b style={{ color:renk,fontSize:16 }}>{isaret}₺{fmt(topla(liste))}</b>
       </div>
-      <button style={{ ...S.addBtn,margin:"12px 0",width:"100%" }} onClick={()=>{ setForm(bos()); setGoster(g=>!g); }}>{goster?"Vazgeç":"+ Ekle"}</button>
+      <button style={{ ...S.addBtn,...btn,margin:"12px 0",width:"100%" }} onClick={()=>{ setForm(bos()); setGoster(g=>!g); }}>{goster?"Vazgeç":"+ Ekle"}</button>
       {goster && (
         <div style={{ display:"grid",gap:8,marginBottom:14,padding:12,background:"#F9FAFB",borderRadius:12 }}>
           <select style={S.select} value={form[alan]} onChange={e=>set(alan,e.target.value)}>{secenekler.map(k=><option key={k}>{k}</option>)}</select>
           <input style={S.input} type="number" inputMode="numeric" placeholder="Tutar (₺)" value={form.tutar} onChange={e=>set("tutar",e.target.value)}/>
           <input style={S.input} type="date" value={form.tarih} onChange={e=>set("tarih",e.target.value)}/>
           <input style={S.input} placeholder="Not (isteğe bağlı)" value={form.not} onChange={e=>set("not",e.target.value)}/>
-          <button style={S.addBtn} onClick={ekle}>Kaydet</button>
+          <button style={{ ...S.addBtn,...btn }} onClick={ekle}>Kaydet</button>
         </div>
       )}
       {liste.length===0 ? <Bos t="Kayıt yok"/> : liste.map(g=>(
@@ -564,52 +567,69 @@ function TabGelirGider() {
   );
 }
 
-// ── BORÇLAR ───────────────────────────────────────────────────────────────
+// ── BORÇLAR (alacaklarımız: sadece not + açık/kapalı) ─────────────────────
 function TabBorclar({ daireler }) {
   const borclar = useCol("borclar"), odemeler = useCol("odemeler");
   const AYLAR = gecmisAylar().reverse(), cur = curKey();
   const [f,setF] = useState("acik");
   const [goster,setGoster] = useState(false);
   const [form,setForm] = useState({ daire:"D1", donem:cur, eksik:"", not:"" });
-  const kalanOf = b => Math.max(0,(b.eksik||0)-(b.odenen||0));
   const dMap = Object.fromEntries(daireler.map(d=>[d.id,d]));
-  const odemeBul = (daire,donem) => odemeler.find(o=>o.daire===daire && o.donem===donem && o.durum==="odendi");
-  async function duzelt(daire, donem, adAy, fark) { // ödenmiş aidat ve gelir kaydını eksik tutar kadar düzeltir
-    const od = odemeBul(daire, donem); if (!od) return;
-    await updateDoc(doc(db,"odemeler",od.id), { tutar:increment(fark) });
-    const g = await aidatBul(daire, donem, adAy);
-    if (g) await updateDoc(doc(db,"gelirler",g.id), { tutar:increment(fark) });
-  }
+  const eski = borclar.filter(b=>b.model!==2);
+
   async function ekle() {
     const eksik = Number(form.eksik);
     if (!(eksik>0)) return alert("Eksik tutarı girin.");
     const a = AYLAR.find(x=>x.key===form.donem), adAy = `${MONTH_NAMES[a.m]} ${a.y}`;
-    await addDoc(collection(db,"borclar"), { daire:form.daire, donem:form.donem, donemAd:adAy, eksik, odenen:0, not:form.not, tarih:bugun(), olusturuldu:serverTimestamp() });
-    await duzelt(form.daire, form.donem, adAy, -eksik);
-    logAction(`${form.daire} ${adAy} eksik ödeme: ₺${eksik}`, "borc_create");
+    await addDoc(collection(db,"borclar"), { daire:form.daire, donem:form.donem, donemAd:adAy, eksik, kapali:false, model:2, not:form.not, tarih:bugun(), olusturuldu:serverTimestamp() });
+    logAction(`${form.daire} ${adAy} eksik ödeme (alacak): ₺${eksik}`, "borc_create");
     setGoster(false); setForm(p=>({ ...p,eksik:"",not:"" }));
   }
-  async function tahsilat(b) {
-    const k = kalanOf(b), v = Number(window.prompt(`Tahsil edilen tutar (kalan ₺${fmt(k)}):`, k));
-    if (!(v>0)) return;
-    await updateDoc(doc(db,"borclar",b.id), { odenen:increment(v) });
-    await addDoc(collection(db,"gelirler"), { kaynak:"borç tahsilatı", daire:b.daire, borcId:b.id, tutar:v, tarih:bugun(), not:`${b.daire} - ${b.donemAd} eksik aidat tahsilatı`, otomatik:true, olusturuldu:serverTimestamp() });
-    logAction(`${b.daire} ${b.donemAd} borç tahsilatı ₺${v}`, "borc_tahsilat");
+  async function kapat(b, kapali) {
+    await updateDoc(doc(db,"borclar",b.id), { kapali, kapanis:kapali?bugun():"" });
+    logAction(`${b.daire} ${b.donemAd} alacak ${kapali?"kapatıldı":"yeniden açıldı"}`, "borc_update");
   }
   async function sil(b) {
-    if (!window.confirm("Borç kaydı silinsin mi? (Yapılmış tahsilatlar gelirde kalır)")) return;
-    if (kalanOf(b)>0) await duzelt(b.daire, b.donem, b.donemAd, kalanOf(b));
+    if (!window.confirm("Kayıt silinsin mi?")) return;
     await deleteDoc(doc(db,"borclar",b.id));
-    logAction(`${b.daire} ${b.donemAd} borç kaydı silindi`, "borc_delete");
+    logAction(`${b.daire} ${b.donemAd} alacak kaydı silindi`, "borc_delete");
   }
+  // Eski düzen: eksik tutar aidat gelirinden düşülmüş, tahsilat ayrı gelir olarak eklenmişti → yeni düzene çevir
+  async function donustur() {
+    if (!window.confirm(`${eski.length} eski kayıt yeni düzene çevrilecek (aidat geliri tam tutara döner, tahsilat gelirleri silinir). Devam edilsin mi?`)) return;
+    for (const b of eski) {
+      const kalan = Math.max(0,(b.eksik||0)-(b.odenen||0));
+      let eksik = b.eksik || 0;
+      const od = odemeler.find(o=>o.daire===b.daire && o.donem===b.donem && o.durum==="odendi");
+      if (od) {
+        await updateDoc(doc(db,"odemeler",od.id), { tutar:increment(eksik) });
+        const g = await aidatBul(b.daire, b.donem, b.donemAd || ayAdi(b.donem));
+        if (g) await updateDoc(doc(db,"gelirler",g.id), { tutar:increment(eksik) });
+        const tahs = await getDocs(query(collection(db,"gelirler"), where("borcId","==",b.id)));
+        for (const t of tahs.docs) await deleteDoc(t.ref);
+        if (kalan>0) eksik = kalan;
+      }
+      await updateDoc(doc(db,"borclar",b.id), { model:2, eksik, kapali:kalan===0, kapanis:kalan===0?bugun():"" });
+    }
+    logAction(`${eski.length} eski borç kaydı yeni düzene çevrildi`, "borc_migrate");
+  }
+
   const liste = borclar.filter(b=>f==="tumu" || (f==="acik"?kalanOf(b)>0:kalanOf(b)===0))
     .sort((a,b)=>String(b.donem).localeCompare(String(a.donem)));
-  const acik = borclar.reduce((a,b)=>a+kalanOf(b),0);
+  const acik = borclar.reduce((a,b)=>a+acikTutar(b),0);
+  const kapanan = topla(borclar.filter(b=>b.model===2 && b.kapali).map(b=>({ tutar:b.eksik })));
   return (
     <div>
+      {eski.length>0 && (
+        <div style={{ ...S.card,borderLeft:"3px solid #BA7517" }}>
+          <div style={{ fontWeight:700,marginBottom:6 }}>⚠️ {eski.length} kayıt eski düzende</div>
+          <div style={{ fontSize:12,color:"#6B7280",marginBottom:10 }}>Kasa hesabının doğru çıkması için yeni düzene çevirin.</div>
+          <button style={S.addBtn} onClick={donustur}>Yeni düzene çevir</button>
+        </div>
+      )}
       <div className="metric-grid" style={{ ...S.metricGrid,gridTemplateColumns:"repeat(2,1fr)" }}>
-        <MetricCard label="Açık Borç" val={`₺${fmt(acik)}`} color={acik?"#D85A30":"#1D9E75"} sub={`${borclar.filter(b=>kalanOf(b)>0).length} kayıt`}/>
-        <MetricCard label="Tahsil Edilen" val={`₺${fmt(topla(borclar.map(b=>({tutar:b.odenen}))))}`} color="#1D9E75"/>
+        <MetricCard label="Açık Alacak" val={`₺${fmt(acik)}`} color={acik?"#D85A30":"#1D9E75"} sub="Kasadan düşülüyor"/>
+        <MetricCard label="Kapanan" val={`₺${fmt(kapanan)}`} color="#1D9E75" sub="Kasaya geri döndü"/>
       </div>
       <button style={{ ...S.addBtn,marginBottom:12 }} onClick={()=>setGoster(g=>!g)}>{goster?"Vazgeç":"+ Eksik Ödeme Ekle"}</button>
       {goster && (
@@ -621,28 +641,31 @@ function TabBorclar({ daireler }) {
             <div><label style={S.label}>Ay</label>
               <select style={S.select} value={form.donem} onChange={e=>setForm(p=>({...p,donem:e.target.value}))}>
                 {AYLAR.map(a=><option key={a.key} value={a.key}>{MONTH_NAMES[a.m]} {a.y}</option>)}</select></div>
-            <div><label style={S.label}>Eksik alınan tutar (₺)</label>
+            <div><label style={S.label}>Alacağımız tutar (₺)</label>
               <input style={S.input} type="number" inputMode="numeric" value={form.eksik} onChange={e=>setForm(p=>({...p,eksik:e.target.value}))}/></div>
             <div><label style={S.label}>Not</label>
               <input style={S.input} placeholder="Örn: kalanı gelecek ay" value={form.not} onChange={e=>setForm(p=>({...p,not:e.target.value}))}/></div>
           </div>
-          <div style={{ fontSize:11,color:"#9CA3AF",margin:"10px 0" }}>O ay aidatı “Ödendi” işaretliyse gelir, eksik tutar kadar otomatik düşülür; tahsil edilince gelire eklenir.</div>
+          <div style={{ fontSize:11,color:"#9CA3AF",margin:"10px 0" }}>Aidat kaydı değişmez. Bu tutar, “Kapatıldı” diyene kadar kasadan düşülür.</div>
           <button style={S.addBtn} onClick={ekle}>Kaydet</button>
         </div>
       )}
-      <Chips secili={f} onChange={setF} items={[{v:"acik",l:"Açık"},{v:"kapali",l:"Kapanan"},{v:"tumu",l:"Tümü"}]}/>
+      <Chips secili={f} onChange={setF} items={[{v:"acik",l:"Açık"},{v:"kapali",l:"Kapatıldı"},{v:"tumu",l:"Tümü"}]}/>
       <div style={S.card}>
         {liste.length===0 ? <Bos t="Kayıt yok"/> : liste.map(b=>(
           <div key={b.id} style={{ padding:"12px 0",borderBottom:"1px solid #F3F4F6" }}>
             <div style={{ display:"flex",justifyContent:"space-between",gap:8 }}>
-              <div><b>{b.daire}</b> · {dMap[b.daire]?sakinAdi(dMap[b.daire],b.donem):""}<div style={{ fontSize:11,color:"#9CA3AF" }}>{b.donemAd}{b.not?` · ${b.not}`:""}</div></div>
+              <div><b>{b.daire}</b> · {dMap[b.daire]?sakinAdi(dMap[b.daire],b.donem):""}
+                <div style={{ fontSize:11,color:"#9CA3AF" }}>{b.donemAd}{b.not?` · ${b.not}`:""}</div></div>
               <div style={{ textAlign:"right" }}>
-                <b style={{ color:kalanOf(b)?"#D85A30":"#1D9E75" }}>{kalanOf(b)?`₺${fmt(kalanOf(b))} kalan`:"Kapandı"}</b>
-                <div style={{ fontSize:11,color:"#9CA3AF" }}>Eksik ₺{fmt(b.eksik)} · Alınan ₺{fmt(b.odenen)}</div>
+                <b style={{ color:kalanOf(b)?"#D85A30":"#1D9E75" }}>₺{fmt(b.eksik)}</b>
+                <div><span style={{ ...S.badge,...(kalanOf(b)?DURUM_STIL.bekliyor:DURUM_STIL.odendi) }}>{kalanOf(b)?"Açık":"Kapatıldı"}</span></div>
               </div>
             </div>
             <div style={{ display:"flex",gap:8,marginTop:8 }}>
-              {kalanOf(b)>0 && <button style={{ ...S.smallBtn,borderColor:"#6ee7b7",color:"#065F46",fontSize:12 }} onClick={()=>tahsilat(b)}>+ Tahsilat</button>}
+              {b.model===2 && (b.kapali
+                ? <button style={{ ...S.smallBtn,fontSize:12 }} onClick={()=>kapat(b,false)}>Yeniden aç</button>
+                : <button style={{ ...S.smallBtn,borderColor:"#6ee7b7",color:"#065F46",fontSize:12 }} onClick={()=>kapat(b,true)}>✓ Kapatıldı</button>)}
               <button style={{ ...S.delBtn,padding:"6px 10px" }} onClick={()=>sil(b)}>Sil</button>
             </div>
           </div>
@@ -662,15 +685,16 @@ function TabRapor({ daireler }) {
   const inP = key => key >= bas && key <= son;
   const yillar = [...new Set([CUR_YEAR, ...[...gelirler.map(gelirAy),...giderler.map(k=>ayOf(k.tarih))].map(k=>Number(k.slice(0,4))).filter(Boolean)])].sort((a,b)=>b-a);
   const gel = gelirler.filter(k=>inP(gelirAy(k))), gid = giderler.filter(k=>inP(ayOf(k.tarih)));
-  const tG = topla(gel), tD = topla(gid), net = tG - tD;
+  const tG = topla(gel), tD = topla(gid);
+  const alacak = borclar.filter(b=>inP(b.donem)).reduce((a,b)=>a+acikTutar(b),0);
+  const net = tG - tD - alacak;
   const donem = ay==="tumu" ? `${yil} yılı` : `${MONTH_NAMES[ay]} ${yil}`;
   const aylik = MONTH_NAMES.map((ad,m)=>({ m, ad,
     g:topla(gelirler.filter(k=>gelirAy(k)===mKey(m))), d:topla(giderler.filter(k=>ayOf(k.tarih)===mKey(m))) })).filter(r=>r.g||r.d);
   const daireRows = daireler.map(d=>{
     const aidatOd = odemeler.filter(o=>o.daire===d.id && o.durum==="odendi" && inP(o.donem));
-    const tahs = gelirler.filter(g=>g.daire===d.id && g.kaynak==="borç tahsilatı" && inP(ayOf(g.tarih)));
-    const acik = borclar.filter(b=>b.daire===d.id && inP(b.donem)).reduce((a,b)=>a+Math.max(0,(b.eksik||0)-(b.odenen||0)),0);
-    return { d, ay:aidatOd.length, toplam:topla(aidatOd)+topla(tahs), acik };
+    const acik = borclar.filter(b=>b.daire===d.id && inP(b.donem)).reduce((a,b)=>a+acikTutar(b),0);
+    return { d, ay:aidatOd.length, toplam:topla(aidatOd)-acik, acik };
   });
   const th = { ...S.th,textAlign:"right" }, tdr = { ...S.td,textAlign:"right" };
   const Liste = ({ baslik, liste, alan, renk }) => (
@@ -698,7 +722,8 @@ function TabRapor({ daireler }) {
       <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:12,marginBottom:16 }}>
         <MetricCard label="Toplam Gelir" val={`₺${fmt(tG)}`} color="#1D9E75"/>
         <MetricCard label="Toplam Gider" val={`₺${fmt(tD)}`} color="#D85A30"/>
-        <MetricCard label="Net" val={`${net<0?"-":""}₺${fmt(Math.abs(net))}`} color={net>=0?"#1D9E75":"#D85A30"}/>
+        <MetricCard label="Açık Alacak" val={`₺${fmt(alacak)}`} color="#BA7517"/>
+        <MetricCard label="Net Kasa" val={`${net<0?"-":""}₺${fmt(Math.abs(net))}`} color={net>=0?"#1D9E75":"#D85A30"}/>
       </div>
       <div style={S.card}>
         <div style={S.cardTitle}>🗓️ {yil} Aylık Özet</div>
@@ -815,7 +840,7 @@ function DairePanel({ daire, ayarlar }) {
   }, [daire.id]);
   const odendiMi = odemeler.some(o=>o.donem===cur && o.durum==="odendi");
   const durum = odendiMi ? "odendi" : "bekliyor";
-  const kalan = b => Math.max(0,(b.eksik||0)-(b.odenen||0));
+  const kalan = kalanOf;
   const acikBorc = borclar.reduce((a,b)=>a+kalan(b),0);
   return (
     <div style={S.app}>
