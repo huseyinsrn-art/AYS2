@@ -556,11 +556,86 @@ function TabAidat({ daireler, aidatTutar }) {
   );
 }
 
+// ── AYLIK ALT KIRILIM (Gelir / Gider ortak) ─────────────────────────────────
+const ayOf = t => (t || "").slice(0, 7);
+
+function ayAdi(key) {
+  if (!key) return "Tarihsiz";
+  const [y, m] = key.split("-");
+  return `${MONTH_NAMES[Number(m) - 1] || m} ${y}`;
+}
+
+function ayFiltrele(kayitlar, secili) {
+  const keys = [...new Set(kayitlar.map(k => ayOf(k.tarih)))].sort().reverse();
+  const gecerli = secili === "tumu" || keys.includes(secili) ? secili : "tumu";
+  const gorunen = gecerli === "tumu" ? kayitlar : kayitlar.filter(k => ayOf(k.tarih) === gecerli);
+  return { keys, gecerli, gorunen };
+}
+
+function AyFiltre({ keys, secili, onChange }) {
+  return (
+    <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap" }}>
+      <span style={{ fontSize:12,fontWeight:600,color:"#6B7280" }}>Dönem:</span>
+      <select style={{ ...S.select,width:"auto",minWidth:170 }} value={secili} onChange={e=>onChange(e.target.value)}>
+        <option value="tumu">Tüm aylar</option>
+        {keys.map(k => <option key={k||"yok"} value={k}>{ayAdi(k)}</option>)}
+      </select>
+    </div>
+  );
+}
+
+// Kayıtları ay ay gruplar; her ay için toplam ve kategori/kaynak kırılımı gösterir
+function AyListe({ kayitlar, alan, etiket, renk, isaret, bos, silinebilir, onSil }) {
+  if (kayitlar.length === 0) {
+    return <div style={S.card}><p style={{ color:"#9CA3AF",padding:"20px 0" }}>{bos}</p></div>;
+  }
+  const grup = {};
+  kayitlar.forEach(k => { const a = ayOf(k.tarih); (grup[a] = grup[a] || []).push(k); });
+  const keys = Object.keys(grup).sort().reverse();
+
+  return keys.map(key => {
+    const liste  = grup[key];
+    const toplam = liste.reduce((a, k) => a + (k.tutar || 0), 0);
+    const kirilim = Object.entries(
+      liste.reduce((acc, k) => { const e = k[alan] || "Diğer"; acc[e] = (acc[e] || 0) + (k.tutar || 0); return acc; }, {})
+    ).sort((a, b) => b[1] - a[1]);
+
+    return (
+      <div key={key||"yok"} style={S.card}>
+        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6 }}>
+          <div style={S.cardTitle}>📅 {ayAdi(key)}</div>
+          <div style={{ fontSize:13,fontWeight:700,color:renk }}>{isaret}₺{fmt(toplam)}
+            <span style={{ fontWeight:500,color:"#9CA3AF",fontSize:11 }}> · {liste.length} kayıt</span>
+          </div>
+        </div>
+        <div style={{ display:"flex",gap:6,flexWrap:"wrap",margin:"10px 0 4px" }}>
+          {kirilim.map(([ad, tut]) => (
+            <span key={ad} style={{ ...S.badge,background:"#F3F4F6",color:"#374151" }}>{ad}: ₺{fmt(tut)}</span>
+          ))}
+        </div>
+        {liste.map(g => (
+          <div key={g.id} style={{ padding:"12px 0",borderBottom:"1px solid #F3F4F6",display:"flex",justifyContent:"space-between",alignItems:"center" }}>
+            <div>
+              <div style={{ fontWeight:600,color:"#111" }}>{etiket(g)}</div>
+              <div style={{ fontSize:12,color:"#9CA3AF" }}>{g.tarih}{g.not ? ` · ${g.not}` : ""}</div>
+            </div>
+            <div style={{ display:"flex",alignItems:"center",gap:8 }}>
+              <span style={{ fontSize:14,fontWeight:700,color:renk }}>{isaret}₺{fmt(g.tutar)}</span>
+              {silinebilir(g) && <button style={{ ...S.delBtn,padding:"4px 8px" }} onClick={()=>onSil(g.id)}>✕</button>}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  });
+}
+
 // ── TAB: GELİRLER ──────────────────────────────────────────────────────────
 function TabGelirler() {
   const [gelirler,setGelirler] = useState([]);
   const [form,setForm] = useState({kaynak:"aidat",tutar:"",tarih:new Date().toISOString().slice(0,10),not:""});
   const [goster,setGoster] = useState(false);
+  const [ay,setAy] = useState("tumu");
 
   useEffect(()=>onSnapshot(query(collection(db,"gelirler"),orderBy("tarih","desc")),
     snap=>setGelirler(snap.docs.map(x=>({id:x.id,...x.data()})))) ,[]);
@@ -580,13 +655,15 @@ function TabGelirler() {
     }
   }
 
-  const topGelir = gelirler.reduce((a,k)=>a+(k.tutar||0),0);
+  const { keys:ayKeys, gecerli:ayGecerli, gorunen } = ayFiltrele(gelirler, ay);
+  const topGelir = gorunen.reduce((a,k)=>a+(k.tutar||0),0);
+  const donemEtiket = ayGecerli==="tumu" ? "Tüm Zamanlar" : ayAdi(ayGecerli);
 
   return (
     <div>
       <div style={{...S.metricGrid,gridTemplateColumns:"repeat(2,1fr)",marginBottom:16}}>
-        <MetricCard label="Toplam Gelir" val={`₺${fmt(topGelir)}`} color="#1D9E75"/>
-        <MetricCard label="Kaynak Sayısı" val={gelirler.length.toString()} color="#0891B2"/>
+        <MetricCard label="Toplam Gelir" val={`₺${fmt(topGelir)}`} color="#1D9E75" sub={donemEtiket}/>
+        <MetricCard label="Kayıt Sayısı" val={gorunen.length.toString()} color="#0891B2" sub={donemEtiket}/>
       </div>
       <button style={{...S.addBtn,marginBottom:12}} onClick={()=>setGoster(true)}>+ Gelir Ekle</button>
       {goster&&(
@@ -613,23 +690,9 @@ function TabGelirler() {
           </div>
         </div>
       )}
-      <div style={S.card}>
-        <div style={S.cardTitle}>💰 Gelir Listesi</div>
-        {gelirler.length===0?<p style={{color:"#9CA3AF",padding:"20px 0"}}>Gelir yok</p>:
-          gelirler.map(g=>(
-            <div key={g.id} style={{padding:"12px 0",borderBottom:"1px solid #F3F4F6",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-              <div>
-                <div style={{fontWeight:600,color:"#111"}}>{(g.kaynak||"").toUpperCase()}</div>
-                <div style={{fontSize:12,color:"#9CA3AF"}}>{g.tarih}{g.not?` · ${g.not}`:""}</div>
-              </div>
-              <div style={{display:"flex",alignItems:"center",gap:8}}>
-                <span style={{fontSize:14,fontWeight:700,color:"#1D9E75"}}>+₺{fmt(g.tutar)}</span>
-                {!g.otomatik&&<button style={{...S.delBtn,padding:"4px 8px"}} onClick={()=>sil(g.id)}>✕</button>}
-              </div>
-            </div>
-          ))
-        }
-      </div>
+      <AyFiltre keys={ayKeys} secili={ayGecerli} onChange={setAy}/>
+      <AyListe kayitlar={gorunen} alan="kaynak" renk="#1D9E75" isaret="+" bos="Gelir yok"
+        etiket={g=>(g.kaynak||"").toUpperCase()} silinebilir={g=>!g.otomatik} onSil={sil}/>
     </div>
   );
 }
@@ -639,6 +702,7 @@ function TabGiderler() {
   const [giderler,setGiderler] = useState([]);
   const [form,setForm] = useState({kategori:"Elektrik",tutar:"",tarih:new Date().toISOString().slice(0,10),not:""});
   const [goster,setGoster] = useState(false);
+  const [ay,setAy] = useState("tumu");
 
   useEffect(()=>onSnapshot(query(collection(db,"giderler"),orderBy("tarih","desc")),
     snap=>setGiderler(snap.docs.map(x=>({id:x.id,...x.data()})))) ,[]);
@@ -658,13 +722,15 @@ function TabGiderler() {
     }
   }
 
-  const topGider = giderler.reduce((a,k)=>a+(k.tutar||0),0);
+  const { keys:ayKeys, gecerli:ayGecerli, gorunen } = ayFiltrele(giderler, ay);
+  const topGider = gorunen.reduce((a,k)=>a+(k.tutar||0),0);
+  const donemEtiket = ayGecerli==="tumu" ? "Tüm Zamanlar" : ayAdi(ayGecerli);
 
   return (
     <div>
       <div style={{...S.metricGrid,gridTemplateColumns:"repeat(2,1fr)",marginBottom:16}}>
-        <MetricCard label="Toplam Gider" val={`₺${fmt(topGider)}`} color="#D85A30"/>
-        <MetricCard label="Kategori Sayısı" val={giderler.length.toString()} color="#6366F1"/>
+        <MetricCard label="Toplam Gider" val={`₺${fmt(topGider)}`} color="#D85A30" sub={donemEtiket}/>
+        <MetricCard label="Kayıt Sayısı" val={gorunen.length.toString()} color="#6366F1" sub={donemEtiket}/>
       </div>
       <button style={{...S.addBtn,marginBottom:12}} onClick={()=>setGoster(true)}>- Gider Ekle</button>
       {goster&&(
@@ -691,23 +757,9 @@ function TabGiderler() {
           </div>
         </div>
       )}
-      <div style={S.card}>
-        <div style={S.cardTitle}>📉 Gider Listesi</div>
-        {giderler.length===0?<p style={{color:"#9CA3AF",padding:"20px 0"}}>Gider yok</p>:
-          giderler.map(g=>(
-            <div key={g.id} style={{padding:"12px 0",borderBottom:"1px solid #F3F4F6",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-              <div>
-                <div style={{fontWeight:600,color:"#111"}}>{g.kategori}</div>
-                <div style={{fontSize:12,color:"#9CA3AF"}}>{g.tarih}{g.not?` · ${g.not}`:""}</div>
-              </div>
-              <div style={{display:"flex",alignItems:"center",gap:8}}>
-                <span style={{fontSize:14,fontWeight:700,color:"#D85A30"}}>-₺{fmt(g.tutar)}</span>
-                <button style={{...S.delBtn,padding:"4px 8px"}} onClick={()=>sil(g.id)}>✕</button>
-              </div>
-            </div>
-          ))
-        }
-      </div>
+      <AyFiltre keys={ayKeys} secili={ayGecerli} onChange={setAy}/>
+      <AyListe kayitlar={gorunen} alan="kategori" renk="#D85A30" isaret="-" bos="Gider yok"
+        etiket={g=>g.kategori} silinebilir={()=>true} onSil={sil}/>
     </div>
   );
 }
