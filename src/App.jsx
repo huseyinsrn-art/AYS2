@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { db, auth } from "./firebase.js";
-import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import {
   collection, doc, setDoc, addDoc, deleteDoc, updateDoc,
-  onSnapshot, query, orderBy, serverTimestamp, getDocs, where
+  onSnapshot, query, orderBy, serverTimestamp, getDocs, where, increment
 } from "firebase/firestore";
 import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from "firebase/auth";
 
@@ -27,6 +26,42 @@ function hataMesaji(e) {
   if (kod.includes("unavailable") || kod.includes("network"))
     return "Sunucuya ulaşılamıyor. İnternet bağlantınızı kontrol edin.";
   return e?.message || "Bilinmeyen hata";
+}
+
+const APT_ADI = "Mert Apartmanı No 105";
+const curKey = () => `${CUR_YEAR}-${String(CUR_MONTH + 1).padStart(2, "0")}`;
+const bugun  = () => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+const topla  = l => l.reduce((a, k) => a + (k.tutar || 0), 0);
+const ayOf   = t => (t || "").slice(0, 7);
+const ayAdi  = key => { if (!key) return "Tarihsiz"; const [y, m] = key.split("-"); return `${MONTH_NAMES[Number(m) - 1] || m} ${y}`; };
+const DURUM_STIL = {
+  odendi:  { background:"#D1FAE5", color:"#065F46" },
+  bekliyor:{ background:"#FEF3C7", color:"#92400E" },
+  gecikti: { background:"#FEE2E2", color:"#991B1B" },
+};
+// Aylık aidat: o aya özel tutar varsa o, yoksa genel tutar
+const aidatOf = (ay, key) => { const v = ay?.aylikAidat?.[key]; return v != null ? Number(v) : Number(ay?.aidatTutar || 2500); };
+
+// Sakin geçmişi: kayıtlar eski ismi korur, yeni isim sadece başlangıç ayından itibaren geçerli olur
+function sakinlar(d, bas, son) {
+  const g = [...(d.sakinGecmis || [])].sort((a, b) => a.baslangic.localeCompare(b.baslangic));
+  if (!g.length) return d.sakinAd || d.ad;
+  const r = g.filter((e, i) => e.baslangic <= son && (!g[i + 1] || g[i + 1].baslangic > bas)).map(e => e.ad || d.ad);
+  return r.join(" → ") || d.sakinAd || d.ad;
+}
+const sakinAdi = (d, key) => sakinlar(d, key, key);
+
+// Bir dairenin belirli ayki aidat gelir kaydını bulur (iptal / düzeltme için)
+async function aidatBul(daireId, key, adAy) {
+  const gs = (await getDocs(query(collection(db, "gelirler"), where("daire", "==", daireId)))).docs.map(x => ({ id:x.id, ...x.data() }));
+  return gs.find(g => g.kaynak === "aidat" && (g.donem === key || (g.not || "").includes(adAy + " aidat")));
+}
+
+function useCol(ad, alan) {
+  const [v, setV] = useState([]);
+  useEffect(() => onSnapshot(alan ? query(collection(db, ad), orderBy(alan, "desc")) : collection(db, ad),
+    sn => setV(sn.docs.map(x => ({ id:x.id, ...x.data() }))), e => console.error(ad, e)), [ad, alan]);
+  return v;
 }
 
 function tumAylar() {
@@ -115,7 +150,7 @@ export default function App() {
     const unsubAyar = onSnapshot(doc(db,"ayarlar","genel"), async snap => {
       try {
         if (snap.exists()) { setAyarlar(snap.data()); return; }
-        const v = { aidatTutar:2500, zamGecmisi:[] };
+        const v = { aidatTutar:2500, aylikAidat:{} };
         if (admin) await setDoc(doc(db,"ayarlar","genel"), v);
         setAyarlar(v);
       } catch (e) { console.error(e); setDbError(hataMesaji(e)); }
@@ -147,10 +182,9 @@ export default function App() {
 
   const isAdmin    = user.email === ADMIN_EMAIL;
   const daire      = daireler.find(d => d.email === user.email);
-  const aidatTutar = ayarlar.aidatTutar || 2500;
-
-  if (isAdmin) return <AdminPanel daireler={daireler} ayarlar={ayarlar} aidatTutar={aidatTutar} />;
-  if (daire)   return <DairePanel daire={{ ...daire, aidat:aidatTutar }} />;
+  
+  if (isAdmin) return <AdminPanel daireler={daireler} ayarlar={ayarlar} />;
+  if (daire)   return <DairePanel daire={daire} ayarlar={ayarlar} />;
   return <HataEkrani mesaj="Hesap bir daireyle eşleşmiyor." />;
 }
 
@@ -171,7 +205,7 @@ function Splash() {
     <div style={{ minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#F9FAFB" }}>
       <div style={{ textAlign:"center" }}>
         <div style={{ fontSize:52,marginBottom:12 }}>🏢</div>
-        <div style={{ fontSize:16,fontWeight:700,color:"#111" }}>105 Numara v3</div>
+        <div style={{ fontSize:16,fontWeight:700,color:"#111" }}>Mert Apartmanı No 105</div>
         <div style={{ fontSize:13,color:"#6B7280",marginTop:4 }}>Yükleniyor...</div>
         <div style={{ display:"flex",gap:6,justifyContent:"center",marginTop:20 }}>
           {[0,1,2].map(i=><div key={i} style={{ width:8,height:8,borderRadius:"50%",background:"#1D9E75",animation:"bounce 1s infinite",animationDelay:`${i*0.2}s` }}/>)}
@@ -211,367 +245,22 @@ function Login() {
   return (
     <div style={S.loginWrap}>
       <div style={S.loginCard}>
-        <div style={{ textAlign:"center",marginBottom:28 }}>
-          <div style={{ fontSize:52,marginBottom:10 }}>🏢</div>
-          <h1 style={S.loginTitle}>105 Numara</h1>
-          <p style={S.loginSub}>Apartman Yönetim Sistemi v3</p>
+        <div style={{ textAlign:"center",marginBottom:24 }}>
+          <div style={{ fontSize:44,marginBottom:8 }}>🏢</div>
+          <h1 style={S.loginTitle}>{APT_ADI}</h1>
         </div>
         <div style={S.field}><label style={S.label}>Kullanıcı Adı</label>
-          <input style={S.input} placeholder="admin veya d1, d2..." value={username}
+          <input style={S.input} autoCapitalize="none" value={username}
             onChange={e=>setUsername(e.target.value)} onKeyDown={e=>e.key==="Enter"&&giris()}/></div>
         <div style={S.field}><label style={S.label}>Şifre</label>
-          <input style={S.input} type="password" placeholder="••••••••" value={sifre}
+          <input style={S.input} type="password" value={sifre}
             onChange={e=>setSifre(e.target.value)} onKeyDown={e=>e.key==="Enter"&&giris()}/></div>
         {hata&&<div style={S.hataBox}>{hata}</div>}
-        <button style={{ ...S.addBtn,width:"100%",padding:12,fontSize:15,fontWeight:700,borderRadius:10,opacity:loading?0.7:1 }}
+        <button style={{ ...S.addBtn,width:"100%",padding:12,fontSize:15,fontWeight:700,opacity:loading?0.7:1 }}
           onClick={giris} disabled={loading}>{loading?"Giriş yapılıyor...":"Giriş Yap"}</button>
-        <div style={S.loginHint}><b>✨ v3 Mimarisi:</b><br/>📊 Ayrı Collections · 🔒 Veri Tutarlılığı · ⏰ 12 saat oturum</div>
       </div>
     </div>
   );
-}
-
-function AdminPanel({ daireler, ayarlar, aidatTutar }) {
-  const [tab,setTab] = useState("ozet");
-  const tabs = [
-    {id:"ozet",   icon:"📊",label:"Özet"},
-    {id:"aidat",  icon:"💳",label:"Aidat"},
-    {id:"gelirler",icon:"💰",label:"Gelirler"},
-    {id:"giderler",icon:"📉",label:"Giderler"},
-    {id:"rapor",  icon:"📑",label:"Rapor"},
-    {id:"duyuru", icon:"📢",label:"Duyuru"},
-    {id:"mesaj",  icon:"💬",label:"Mesaj"},
-    {id:"ayarlar",icon:"⚙️", label:"Ayarlar"},
-  ];
-  return (
-    <div style={S.app}>
-      <Topbar title="105 Numara v3" sub="Yönetici Paneli" onCikis={()=>signOut(auth)} />
-      <div className="desktop-nav" style={S.desktopNav}>
-        {tabs.map(t=>(
-          <button key={t.id} style={{ ...S.navBtn,...(tab===t.id?S.navActive:{}) }} onClick={()=>setTab(t.id)}>
-            {t.icon} {t.label}
-          </button>
-        ))}
-      </div>
-      <div style={S.content}>
-        {tab==="ozet"      && <TabOzet       daireler={daireler} aidatTutar={aidatTutar}/>}
-        {tab==="aidat"     && <TabAidat      daireler={daireler} aidatTutar={aidatTutar}/>}
-        {tab==="gelirler"  && <TabGelirler   />}
-        {tab==="giderler"  && <TabGiderler   />}
-        {tab==="rapor"     && <TabRapor      />}
-        {tab==="duyuru"    && <TabDuyuru     />}
-        {tab==="mesaj"     && <TabMesaj      daireler={daireler}/>}
-        {tab==="ayarlar"   && <TabAyarlar    ayarlar={ayarlar} daireler={daireler}/>}
-      </div>
-      <div className="mobile-nav" style={S.mobileNav}>
-        {tabs.map(t=>(
-          <button key={t.id} style={{ ...S.mobileNavBtn,...(tab===t.id?S.mobileNavActive:{}) }} onClick={()=>setTab(t.id)}>
-            <span style={{ fontSize:16 }}>{t.icon}</span>
-            <span style={{ fontSize:9 }}>{t.label}</span>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ── TAB: ÖZET ─────────────────────────────────────────────────────────────
-function TabOzet({ daireler, aidatTutar }) {
-  const [odemeler,setOdemeler]   = useState([]);
-  const [gelirler,setGelirler]   = useState([]);
-  const [giderler,setGiderler]   = useState([]);
-  const [duyurular,setDuyurular] = useState([]);
-
-  useEffect(()=>{
-    const u1=onSnapshot(query(collection(db,"odemeler"),orderBy("tarih","desc")),
-      snap=>setOdemeler(snap.docs.map(x=>({id:x.id,...x.data()}))));
-    const u2=onSnapshot(query(collection(db,"gelirler"),orderBy("tarih","desc")),
-      snap=>setGelirler(snap.docs.map(x=>({id:x.id,...x.data()}))));
-    const u3=onSnapshot(query(collection(db,"giderler"),orderBy("tarih","desc")),
-      snap=>setGiderler(snap.docs.map(x=>({id:x.id,...x.data()}))));
-    const u4=onSnapshot(query(collection(db,"duyurular"),orderBy("tarih","desc")),
-      snap=>setDuyurular(snap.docs.map(x=>({id:x.id,...x.data()})).slice(0,3)));
-    return()=>{u1();u2();u3();u4();};
-  },[daireler.length]);
-
-  const buAyKey = `${CUR_YEAR}-${String(CUR_MONTH + 1).padStart(2,"0")}`;
-  const buAyOdemeler = odemeler.filter(o=>o.donem===buAyKey);
-  const odendi = buAyOdemeler.filter(o=>o.durum==="odendi").length;
-  const gecikti = buAyOdemeler.filter(o=>o.durum==="gecikti").length;
-  const bekliyor = daireler.length - odendi - gecikti;
-  const tahsilat = odendi * aidatTutar;
-  const beklenen = daireler.length * aidatTutar;
-  const yuzde = daireler.length ? Math.round((odendi/daireler.length)*100) : 0;
-  const tumGelir = gelirler.reduce((a,k)=>a+(k.tutar||0),0);
-  const tumGider = giderler.reduce((a,k)=>a+(k.tutar||0),0);
-  const ayGelir = gelirler.filter(k=>k.tarih?.startsWith(buAyKey)).reduce((a,k)=>a+(k.tutar||0),0);
-  const ayGider = giderler.filter(k=>k.tarih?.startsWith(buAyKey)).reduce((a,k)=>a+(k.tutar||0),0);
-
-  // Grafikler için veri hazırla
-  const odemeData = [
-    {name:"Ödendi",value:odendi,color:"#1D9E75"},
-    {name:"Bekliyor",value:bekliyor,color:"#BA7517"},
-    {name:"Gecikmiş",value:gecikti,color:"#D85A30"},
-  ];
-
-  const aylıData = gecmisAylar().map(ay=>{
-    const k = `${ay.y}-${String(ay.m+1).padStart(2,"0")}`;
-    const gel = gelirler.filter(g=>g.tarih?.startsWith(k)).reduce((a,x)=>a+(x.tutar||0),0);
-    const gid = giderler.filter(g=>g.tarih?.startsWith(k)).reduce((a,x)=>a+(x.tutar||0),0);
-    return {ay:`${MONTHS_SHORT[ay.m]} ${ay.y}`,Gelir:gel,Gider:gid};
-  });
-
-  const giderKatData = Object.entries(
-    giderler.reduce((acc,g)=>{acc[g.kategori]=(acc[g.kategori]||0)+(g.tutar||0);return acc;},{})
-  ).map(([k,v])=>({name:k,value:v})).sort((a,b)=>b.value-a.value).slice(0,6);
-
-  const gelirKaynakData = Object.entries(
-    gelirler.reduce((acc,g)=>{acc[g.kaynak]=(acc[g.kaynak]||0)+(g.tutar||0);return acc;},{})
-  ).map(([k,v])=>({name:k,value:v}));
-
-  return (
-    <div>
-      <div className="metric-grid" style={S.metricGrid}>
-        <MetricCard label="Bu Ay Tahsilat" val={`₺${fmt(tahsilat)}`} color="#1D9E75" sub={`%${yuzde} tamamlandı`}/>
-        <MetricCard label="Geciken" val={`${gecikti} daire`} color="#D85A30" sub={`₺${fmt(gecikti*aidatTutar)}`}/>
-        <MetricCard label="Bu Ay Gelir" val={`₺${fmt(ayGelir)}`} color="#1D9E75" sub={MONTH_NAMES[CUR_MONTH]}/>
-        <MetricCard label="Genel Bakiye" val={`₺${fmt(tumGelir-tumGider)}`} color={tumGelir>=tumGider?"#1D9E75":"#D85A30"}/>
-      </div>
-
-      <div style={S.card}>
-        <div style={S.cardTitle}>{MONTH_NAMES[CUR_MONTH]} {CUR_YEAR} · Aidat Tahsilatı</div>
-        <div style={{marginBottom:14,marginTop:12}}>
-          <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"#6B7280",marginBottom:6}}>
-            <span style={{fontWeight:700,color:"#1D9E75",fontSize:15}}>₺{fmt(tahsilat)}</span>
-            <span>Hedef: ₺{fmt(beklenen)}</span>
-          </div>
-          <div style={S.barTrack}><div style={{...S.barFill,width:`${yuzde}%`,background:"linear-gradient(90deg,#1D9E75,#34d399)"}}/></div>
-          <div style={{fontSize:12,color:"#1D9E75",marginTop:6,fontWeight:600}}>%{yuzde} tahsil edildi</div>
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:12}}>
-          <div style={{background:"#D1FAE5",borderRadius:10,padding:10,textAlign:"center"}}>
-            <div style={{fontSize:20,fontWeight:700,color:"#065F46"}}>{odendi}</div>
-            <div style={{fontSize:11,color:"#059669"}}>Ödendi</div>
-          </div>
-          <div style={{background:"#FEF3C7",borderRadius:10,padding:10,textAlign:"center"}}>
-            <div style={{fontSize:20,fontWeight:700,color:"#92400E"}}>{bekliyor}</div>
-            <div style={{fontSize:11,color:"#b45309"}}>Bekliyor</div>
-          </div>
-          <div style={{background:"#FEE2E2",borderRadius:10,padding:10,textAlign:"center"}}>
-            <div style={{fontSize:20,fontWeight:700,color:"#991B1B"}}>{gecikti}</div>
-            <div style={{fontSize:11,color:"#dc2626"}}>Gecikmiş</div>
-          </div>
-        </div>
-      </div>
-
-      <div className="two-col" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-        <div style={S.card}>
-          <div style={S.cardTitle}>🥧 Ödeme Durumu Dağılımı</div>
-          <ResponsiveContainer width="100%" height={220}>
-            <PieChart><Pie data={odemeData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} 
-              dataKey="value" label={({name,value})=>`${name} ${value}`}>
-              {odemeData.map((e,i)=><Cell key={i} fill={e.color}/>)}
-            </Pie>
-            <Tooltip formatter={v=>`${v} daire`}/></PieChart>
-          </ResponsiveContainer>
-        </div>
-        <div style={S.card}>
-          <div style={S.cardTitle}>💰 Gelir Kaynakları</div>
-          {gelirKaynakData.length===0?<p style={{color:"#9CA3AF",padding:"40px 0",textAlign:"center"}}>Veri yok</p>:
-            <div>
-              {gelirKaynakData.map((g,i)=>(
-                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid #F3F4F6"}}>
-                  <span style={{fontSize:12,color:"#6B7280",fontWeight:500}}>{g.name}</span>
-                  <span style={{fontSize:13,fontWeight:700,color:"#1D9E75"}}>₺{fmt(g.value)}</span>
-                </div>
-              ))}
-            </div>
-          }
-        </div>
-      </div>
-
-      <div style={S.card}>
-        <div style={S.cardTitle}>📈 Aylık Gelir & Gider Trendi</div>
-        {aylıData.length===0?<p style={{color:"#9CA3AF",padding:"40px 0",textAlign:"center"}}>Veri yok</p>:
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={aylıData}><CartesianGrid strokeDasharray="3 3" stroke="#F3F4F6"/><XAxis dataKey="ay" fontSize={12}/>
-              <YAxis fontSize={12}/><Tooltip formatter={v=>`₺${fmt(v)}`}/>
-              <Legend/><Line type="monotone" dataKey="Gelir" stroke="#1D9E75" strokeWidth={2} dot={{fill:"#1D9E75"}}/>
-              <Line type="monotone" dataKey="Gider" stroke="#D85A30" strokeWidth={2} dot={{fill:"#D85A30"}}/>
-            </LineChart>
-          </ResponsiveContainer>
-        }
-      </div>
-
-      <div style={S.card}>
-        <div style={S.cardTitle}>📊 Giderlerin Kategori Dağılımı (Top 6)</div>
-        {giderKatData.length===0?<p style={{color:"#9CA3AF",padding:"40px 0",textAlign:"center"}}>Gider yok</p>:
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={giderKatData}><CartesianGrid strokeDasharray="3 3" stroke="#F3F4F6"/><XAxis dataKey="name" fontSize={11}/>
-              <YAxis fontSize={12}/><Tooltip formatter={v=>`₺${fmt(v)}`}/>
-              <Bar dataKey="value" fill="#D85A30" name="Tutar" radius={[8,8,0,0]}/>
-            </BarChart>
-          </ResponsiveContainer>
-        }
-      </div>
-
-      <div className="two-col" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-        <div style={S.card}>
-          <div style={S.cardTitle}>💳 Son İşlemler</div>
-          {gelirler.length===0?<p style={{color:"#9CA3AF",fontSize:12}}>İşlem yok</p>:
-            gelirler.slice(0,5).map(g=>(
-              <div key={g.id} style={{padding:"8px 0",borderBottom:"1px solid #F3F4F6",display:"flex",justifyContent:"space-between"}}>
-                <div style={{fontSize:12}}>
-                  <div style={{color:"#374151",fontWeight:500}}>{(g.kaynak||"").toUpperCase()}</div>
-                  <div style={{color:"#9CA3AF",fontSize:10}}>{g.tarih}</div>
-                </div>
-                <span style={{fontSize:13,fontWeight:700,color:"#1D9E75"}}>+₺{fmt(g.tutar)}</span>
-              </div>
-            ))
-          }
-        </div>
-        <div style={S.card}>
-          <div style={S.cardTitle}>📢 Son Duyurular</div>
-          {duyurular.length===0?<p style={{color:"#9CA3AF",fontSize:12}}>Duyuru yok</p>:
-            duyurular.map(du=>(
-              <div key={du.id} style={{fontSize:11,paddingBottom:8,borderBottom:"1px solid #F3F4F6",marginBottom:8}}>
-                <div style={{fontWeight:600,color:"#374151"}}>{du.baslik}</div>
-                <div style={{color:"#9CA3AF",fontSize:10,marginTop:2}}>{du.tarih}</div>
-              </div>
-            ))
-          }
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── TAB: AİDAT ────────────────────────────────────────────────────────────
-function TabAidat({ daireler, aidatTutar }) {
-  const TUM_AYLAR = tumAylar();
-  const [seciliIdx,setSeciliIdx] = useState(() => {
-    const idx = TUM_AYLAR.findIndex(a=>a.y===CUR_YEAR&&a.m===CUR_MONTH);
-    return idx>=0?idx:0;
-  });
-  const [filtre,setFiltre] = useState("tumu");
-  const [odemeler,setOdemeler] = useState([]);
-
-  const secilenAy = TUM_AYLAR[seciliIdx];
-  const donemKey = secilenAy?.key;
-  const donemAd = secilenAy?`${MONTH_NAMES[secilenAy.m]} ${secilenAy.y}`:"";
-  const gelecek = secilenAy && (secilenAy.y>CUR_YEAR||(secilenAy.y===CUR_YEAR&&secilenAy.m>CUR_MONTH));
-
-  useEffect(()=>onSnapshot(query(collection(db,"odemeler"),where("donem","==",donemKey)),
-    snap=>setOdemeler(snap.docs.map(x=>({id:x.id,...x.data()})))), [donemKey]);
-
-  async function odemeToggle(daire, mevcut) {
-    if (gelecek) return;
-    if (mevcut?.durum==="odendi") {
-      // İptal
-      await deleteDoc(doc(db,"odemeler",mevcut.id));
-      logAction(`${daire.id} ödeme iptal`, "odeme_cancel");
-    } else {
-      // Yeni ödeme
-      const bugun = new Date().toISOString().slice(0,10);
-      await addDoc(collection(db,"odemeler"),{
-        daire:daire.id, donem:donemKey, donemAd, tutar:aidatTutar,
-        durum:"odendi", tarih:bugun, olusturuldu:serverTimestamp()
-      });
-      await addDoc(collection(db,"gelirler"),{
-        kaynak:"aidat", daire:daire.id, tutar:aidatTutar, tarih:bugun,
-        not:`${daire.ad} - ${donemAd} aidatı`, otomatik:true, olusturuldu:serverTimestamp()
-      });
-      logAction(`${daire.id} ödeme kaydı`, "odeme_record");
-    }
-  }
-
-  const odeniMap = Object.fromEntries(odemeler.map(o=>[o.daire,o]));
-  const rows = daireler.map(d=>({...d,odeme:odeniMap[d.id]||{durum:"bekliyor"}}))
-    .filter(d=>filtre==="tumu"||(gelecek?false:d.odeme.durum===filtre));
-
-  const odendi = gelecek?0:daireler.filter(d=>odeniMap[d.id]?.durum==="odendi").length;
-  const gecikti = gelecek?0:daireler.filter(d=>odeniMap[d.id]?.durum==="gecikti").length;
-
-  return (
-    <div>
-      <div style={S.card}>
-        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,justifyContent:"space-between",flexWrap:"wrap"}}>
-          <button style={S.arrowBtn} onClick={()=>setSeciliIdx(i=>Math.max(0,i-1))}>‹</button>
-          <span style={{fontSize:17,fontWeight:700,color:"#111"}}>{donemAd}</span>
-          <button style={S.arrowBtn} onClick={()=>setSeciliIdx(i=>Math.min(TUM_AYLAR.length-1,i+1))}>›</button>
-        </div>
-        {!gelecek && (
-          <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
-            {["tumu","odendi","bekliyor","gecikti"].map(f=>(
-              <button key={f} style={{...S.filterBtn,...(filtre===f?S.filterActive:{})}}
-                onClick={()=>setFiltre(f)}>{f==="tumu"?"Tümü":DURUM_LABEL[f]}</button>
-            ))}
-          </div>
-        )}
-        {!gelecek && (
-          <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
-            <span style={{...S.badge,background:"#D1FAE5",color:"#065F46"}}>✓ {odendi} ödedi · ₺{fmt(odendi*aidatTutar)}</span>
-            <span style={{...S.badge,background:"#FEE2E2",color:"#991B1B"}}>✗ {gecikti} gecikti · ₺{fmt(gecikti*aidatTutar)}</span>
-            <span style={{...S.badge,background:"#FEF3C7",color:"#92400E"}}>⌛ {daireler.length-odendi-gecikti} bekliyor</span>
-          </div>
-        )}
-      </div>
-
-      {gelecek?(
-        <div style={{...S.card,textAlign:"center",padding:"32px 20px"}}>
-          <div style={{fontSize:32,marginBottom:8}}>📅</div>
-          <div style={{fontSize:14,fontWeight:600,color:"#374151"}}>{donemAd} henüz gelmedi</div>
-        </div>
-      ):(
-        <div style={S.card}>
-          <div style={{overflowX:"auto"}}>
-            <table style={S.table}>
-              <thead><tr>
-                <th style={S.th}>Daire</th><th style={S.th}>Sakin Adı</th><th style={S.th}>Tutar</th>
-                <th style={S.th}>Tarih</th><th style={S.th}>Durum</th><th style={S.th}>İşlem</th>
-              </tr></thead>
-              <tbody>{rows.map(d=>(
-                <tr key={d.id}>
-                  <td style={S.td}><b>{d.id}</b></td>
-                  <td style={S.td}>{d.sakinAd||d.ad}</td>
-                  <td style={S.td}>₺{fmt(d.odeme.tutar||aidatTutar)}</td>
-                  <td style={S.td}>{d.odeme.tarih||"—"}</td>
-                  <td style={S.td}>
-                    <span style={{...S.badge,...(d.odeme.durum==="odendi"
-                      ?{background:"#D1FAE5",color:"#065F46"}:{background:"#FEF3C7",color:"#92400E"})}}>
-                      {DURUM_LABEL[d.odeme.durum]}
-                    </span>
-                  </td>
-                  <td style={S.td}>
-                    <button style={{...S.smallBtn,fontSize:11,borderColor:d.odeme.durum==="odendi"?"#fca5a5":"#6ee7b7",color:d.odeme.durum==="odendi"?"#991B1B":"#065F46"}}
-                      onClick={()=>odemeToggle(d,d.odeme)}>
-                      {d.odeme.durum==="odendi"?"İptal":"✓ Ödendi"}
-                    </button>
-                  </td>
-                </tr>
-              ))}</tbody>
-            </table>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── AYLIK ALT KIRILIM (Gelir / Gider ortak) ─────────────────────────────────
-const ayOf = t => (t || "").slice(0, 7);
-
-function ayAdi(key) {
-  if (!key) return "Tarihsiz";
-  const [y, m] = key.split("-");
-  return `${MONTH_NAMES[Number(m) - 1] || m} ${y}`;
-}
-
-function ayFiltrele(kayitlar, secili) {
-  const keys = [...new Set(kayitlar.map(k => ayOf(k.tarih)))].sort().reverse();
-  const gecerli = secili === "tumu" || keys.includes(secili) ? secili : "tumu";
-  const gorunen = gecerli === "tumu" ? kayitlar : kayitlar.filter(k => ayOf(k.tarih) === gecerli);
-  return { keys, gecerli, gorunen };
 }
 
 function Chips({ items, secili, onChange }) {
@@ -584,506 +273,492 @@ function Chips({ items, secili, onChange }) {
   );
 }
 
-function AyFiltre({ keys, secili, onChange }) {
-  return <Chips secili={secili} onChange={onChange}
-    items={[{ v:"tumu", l:"Tümü" }, ...keys.map(k => ({ v:k, l:ayAdi(k) }))]} />;
+const Bos = ({ t }) => <p style={{ color:"#9CA3AF",padding:"16px 0",fontSize:13 }}>{t}</p>;
+
+function AdminPanel({ daireler, ayarlar }) {
+  const [tab,setTab] = useState("ozet");
+  const tabs = [
+    {id:"ozet",   icon:"📊",label:"Özet"},
+    {id:"aidat",  icon:"💳",label:"Aidat"},
+    {id:"gg",     icon:"💰",label:"Gelir-Gider"},
+    {id:"borclar",icon:"🧾",label:"Borçlar"},
+    {id:"rapor",  icon:"📑",label:"Rapor"},
+    {id:"ayarlar",icon:"⚙️", label:"Ayarlar"},
+  ];
+  return (
+    <div style={S.app}>
+      <Topbar title={APT_ADI} sub="Yönetici Paneli" onCikis={()=>signOut(auth)} />
+      <div className="desktop-nav" style={S.desktopNav}>
+        {tabs.map(t=>(
+          <button key={t.id} style={{ ...S.navBtn,...(tab===t.id?S.navActive:{}) }} onClick={()=>setTab(t.id)}>{t.icon} {t.label}</button>
+        ))}
+      </div>
+      <div style={S.content}>
+        {tab==="ozet"    && <TabOzet    daireler={daireler} ayarlar={ayarlar}/>}
+        {tab==="aidat"   && <TabAidat   daireler={daireler} ayarlar={ayarlar}/>}
+        {tab==="gg"      && <TabGelirGider/>}
+        {tab==="borclar" && <TabBorclar daireler={daireler}/>}
+        {tab==="rapor"   && <TabRapor   daireler={daireler}/>}
+        {tab==="ayarlar" && <TabAyarlar daireler={daireler}/>}
+      </div>
+      <div className="mobile-nav" style={S.mobileNav}>
+        {tabs.map(t=>(
+          <button key={t.id} style={{ ...S.mobileNavBtn,...(tab===t.id?S.mobileNavActive:{}) }} onClick={()=>setTab(t.id)}>
+            <span style={{ fontSize:17 }}>{t.icon}</span><span style={{ fontSize:10 }}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
-// Kayıtları ay ay gruplar; her ay için toplam ve kategori/kaynak kırılımı gösterir
-function AyListe({ kayitlar, alan, etiket, renk, isaret, bos, silinebilir, onSil }) {
-  if (kayitlar.length === 0) {
-    return <div style={S.card}><p style={{ color:"#9CA3AF",padding:"20px 0" }}>{bos}</p></div>;
-  }
-  const grup = {};
-  kayitlar.forEach(k => { const a = ayOf(k.tarih); (grup[a] = grup[a] || []).push(k); });
-  const keys = Object.keys(grup).sort().reverse();
-
-  return keys.map(key => {
-    const liste  = grup[key];
-    const toplam = liste.reduce((a, k) => a + (k.tutar || 0), 0);
-    const kirilim = Object.entries(
-      liste.reduce((acc, k) => { const e = k[alan] || "Diğer"; acc[e] = (acc[e] || 0) + (k.tutar || 0); return acc; }, {})
-    ).sort((a, b) => b[1] - a[1]);
-
-    return (
-      <div key={key||"yok"} style={S.card}>
-        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6 }}>
-          <div style={S.cardTitle}>📅 {ayAdi(key)}</div>
-          <div style={{ fontSize:13,fontWeight:700,color:renk }}>{isaret}₺{fmt(toplam)}
-            <span style={{ fontWeight:500,color:"#9CA3AF",fontSize:11 }}> · {liste.length} kayıt</span>
-          </div>
-        </div>
-        <div style={{ display:"flex",gap:6,flexWrap:"wrap",margin:"10px 0 4px" }}>
-          {kirilim.map(([ad, tut]) => (
-            <span key={ad} style={{ ...S.badge,background:"#F3F4F6",color:"#374151" }}>{ad}: ₺{fmt(tut)}</span>
+// ── ÖZET ──────────────────────────────────────────────────────────────────
+function TabOzet({ daireler, ayarlar }) {
+  const odemeler = useCol("odemeler"), gelirler = useCol("gelirler","tarih"), giderler = useCol("giderler","tarih"), borclar = useCol("borclar");
+  const cur = curKey(), aidat = aidatOf(ayarlar, cur);
+  const odenenSet = new Set(odemeler.filter(o=>o.durum==="odendi").map(o=>`${o.daire}|${o.donem}`));
+  const buAy = odemeler.filter(o=>o.donem===cur && o.durum==="odendi");
+  const tahsilat = topla(buAy), beklenen = daireler.length * aidat;
+  const yuzde = beklenen ? Math.min(100, Math.round(tahsilat / beklenen * 100)) : 0;
+  const gecmis = gecmisAylar().map(a=>a.key).filter(k=>k<cur);
+  const geciken = daireler.map(d=>{
+    const aylar = gecmis.filter(k=>!odenenSet.has(`${d.id}|${k}`));
+    return { d, aylar, tutar:aylar.reduce((a,k)=>a+aidatOf(ayarlar,k),0) };
+  }).filter(x=>x.aylar.length);
+  const acikBorc = borclar.reduce((a,b)=>a+Math.max(0,(b.eksik||0)-(b.odenen||0)),0);
+  const kasa = topla(gelirler) - topla(giderler);
+  const son = [...gelirler.map(g=>({...g,t:"g"})), ...giderler.map(g=>({...g,t:"d"}))]
+    .sort((a,b)=>(b.tarih||"").localeCompare(a.tarih||"")).slice(0,6);
+  return (
+    <div>
+      <div className="metric-grid" style={S.metricGrid}>
+        <MetricCard label="Bu Ay Tahsilat" val={`₺${fmt(tahsilat)}`} color="#1D9E75" sub={`%${yuzde} · ${buAy.length}/${daireler.length} daire`}/>
+        <MetricCard label="Kalan Tahsilat" val={`₺${fmt(Math.max(0,beklenen-tahsilat))}`} color="#BA7517" sub={`Hedef ₺${fmt(beklenen)}`}/>
+        <MetricCard label="Geciken" val={`${geciken.length} daire`} color={geciken.length?"#D85A30":"#1D9E75"} sub={`₺${fmt(geciken.reduce((a,x)=>a+x.tutar,0))}`}/>
+        <MetricCard label="Kasa" val={`₺${fmt(kasa)}`} color={kasa>=0?"#1D9E75":"#D85A30"} sub={acikBorc?`Açık borç ₺${fmt(acikBorc)}`:"Açık borç yok"}/>
+      </div>
+      <div style={S.card}>
+        <div style={S.cardTitle}>{ayAdi(cur)} · Aidat ₺{fmt(aidat)}</div>
+        <div style={{ ...S.barTrack,margin:"14px 0 6px" }}><div style={{ ...S.barFill,width:`${yuzde}%`,background:"#1D9E75" }}/></div>
+        <div style={{ fontSize:12,color:"#6B7280" }}>{daireler.length-buAy.length} daire bekliyor</div>
+      </div>
+      <div className="two-col" style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12 }}>
+        <div style={S.card}>
+          <div style={S.cardTitle}>⚠️ Geciken Ödemeler</div>
+          {geciken.length===0 ? <Bos t="Geciken ödeme yok 🎉"/> : geciken.map(({d,aylar,tutar})=>(
+            <div key={d.id} style={{ padding:"10px 0",borderBottom:"1px solid #F3F4F6" }}>
+              <div style={{ display:"flex",justifyContent:"space-between",fontSize:13 }}>
+                <b>{d.id} · {sakinAdi(d,cur)}</b><b style={{ color:"#D85A30" }}>₺{fmt(tutar)}</b>
+              </div>
+              <div style={{ fontSize:11,color:"#9CA3AF",marginTop:2 }}>{aylar.map(k=>MONTHS_SHORT[Number(k.slice(5))-1]).join(", ")} ({aylar.length} ay)</div>
+            </div>
           ))}
         </div>
-        {liste.map(g => (
-          <div key={g.id} style={{ padding:"12px 0",borderBottom:"1px solid #F3F4F6",display:"flex",justifyContent:"space-between",alignItems:"center" }}>
-            <div>
-              <div style={{ fontWeight:600,color:"#111" }}>{etiket(g)}</div>
-              <div style={{ fontSize:12,color:"#9CA3AF" }}>{g.tarih}{g.not ? ` · ${g.not}` : ""}</div>
+        <div style={S.card}>
+          <div style={S.cardTitle}>🕒 Son Hareketler</div>
+          {son.length===0 ? <Bos t="Kayıt yok"/> : son.map(g=>(
+            <div key={g.t+g.id} style={{ padding:"10px 0",borderBottom:"1px solid #F3F4F6",display:"flex",justifyContent:"space-between",fontSize:13 }}>
+              <div><div style={{ fontWeight:600 }}>{g.t==="g"?(g.kaynak||"").toUpperCase():g.kategori}</div><div style={{ fontSize:11,color:"#9CA3AF" }}>{g.tarih}</div></div>
+              <b style={{ color:g.t==="g"?"#1D9E75":"#D85A30" }}>{g.t==="g"?"+":"-"}₺{fmt(g.tutar)}</b>
             </div>
-            <div style={{ display:"flex",alignItems:"center",gap:8 }}>
-              <span style={{ fontSize:14,fontWeight:700,color:renk }}>{isaret}₺{fmt(g.tutar)}</span>
-              {silinebilir(g) && <button style={{ ...S.delBtn,padding:"4px 8px" }} onClick={()=>onSil(g.id)}>✕</button>}
-            </div>
-          </div>
-        ))}
-      </div>
-    );
-  });
-}
-
-// ── TAB: GELİRLER ──────────────────────────────────────────────────────────
-function TabGelirler() {
-  const [gelirler,setGelirler] = useState([]);
-  const [form,setForm] = useState({kaynak:"aidat",tutar:"",tarih:new Date().toISOString().slice(0,10),not:""});
-  const [goster,setGoster] = useState(false);
-  const [ay,setAy] = useState("tumu");
-
-  useEffect(()=>onSnapshot(query(collection(db,"gelirler"),orderBy("tarih","desc")),
-    snap=>setGelirler(snap.docs.map(x=>({id:x.id,...x.data()})))) ,[]);
-
-  async function ekle() {
-    if(!form.tutar) return;
-    await addDoc(collection(db,"gelirler"),{...form,tutar:Number(form.tutar),olusturuldu:serverTimestamp()});
-    logAction(`Gelir eklendi: ${form.kaynak} ₺${form.tutar}`, "gelir_create");
-    setGoster(false);
-    setForm({kaynak:"aidat",tutar:"",tarih:new Date().toISOString().slice(0,10),not:""});
-  }
-
-  async function sil(id) {
-    if(window.confirm("Silinsin mi?")) {
-      await deleteDoc(doc(db,"gelirler",id));
-      logAction(`Gelir silindi`, "gelir_delete");
-    }
-  }
-
-  const { keys:ayKeys, gecerli:ayGecerli, gorunen } = ayFiltrele(gelirler, ay);
-  const topGelir = gorunen.reduce((a,k)=>a+(k.tutar||0),0);
-  const donemEtiket = ayGecerli==="tumu" ? "Tüm Zamanlar" : ayAdi(ayGecerli);
-
-  return (
-    <div>
-      <div style={{...S.metricGrid,gridTemplateColumns:"repeat(2,1fr)",marginBottom:16}}>
-        <MetricCard label="Toplam Gelir" val={`₺${fmt(topGelir)}`} color="#1D9E75" sub={donemEtiket}/>
-        <MetricCard label="Kayıt Sayısı" val={gorunen.length.toString()} color="#0891B2" sub={donemEtiket}/>
-      </div>
-      <button style={{...S.addBtn,marginBottom:12}} onClick={()=>setGoster(true)}>+ Gelir Ekle</button>
-      {goster&&(
-        <div style={{...S.card,marginBottom:16}}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>➕ Gelir Ekle</div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
-            <div><label style={S.label}>Kaynak</label>
-              <select style={S.select} value={form.kaynak} onChange={e=>setForm(p=>({...p,kaynak:e.target.value}))}>
-                {["aidat","kira","bağış","diğer"].map(k=><option key={k}>{k}</option>)}
-              </select></div>
-            <div><label style={S.label}>Tutar (₺)</label>
-              <input style={S.input} type="number" placeholder="0" value={form.tutar}
-                onChange={e=>setForm(p=>({...p,tutar:e.target.value}))}/></div>
-            <div><label style={S.label}>Tarih</label>
-              <input style={S.input} type="date" value={form.tarih}
-                onChange={e=>setForm(p=>({...p,tarih:e.target.value}))}/></div>
-            <div><label style={S.label}>Not</label>
-              <input style={S.input} placeholder="Açıklama..." value={form.not}
-                onChange={e=>setForm(p=>({...p,not:e.target.value}))}/></div>
-          </div>
-          <div style={{display:"flex",gap:8}}>
-            <button style={S.addBtn} onClick={ekle}>Ekle</button>
-            <button style={S.filterBtn} onClick={()=>setGoster(false)}>İptal</button>
-          </div>
+          ))}
         </div>
-      )}
-      <AyFiltre keys={ayKeys} secili={ayGecerli} onChange={setAy}/>
-      <AyListe kayitlar={gorunen} alan="kaynak" renk="#1D9E75" isaret="+" bos="Gelir yok"
-        etiket={g=>(g.kaynak||"").toUpperCase()} silinebilir={g=>!g.otomatik} onSil={sil}/>
+      </div>
     </div>
   );
 }
 
-// ── TAB: GİDERLER ──────────────────────────────────────────────────────────
-function TabGiderler() {
-  const [giderler,setGiderler] = useState([]);
-  const [form,setForm] = useState({kategori:"Elektrik",tutar:"",tarih:new Date().toISOString().slice(0,10),not:""});
-  const [goster,setGoster] = useState(false);
-  const [ay,setAy] = useState("tumu");
+// ── AİDAT ─────────────────────────────────────────────────────────────────
+function TabAidat({ daireler, ayarlar }) {
+  const AYLAR = tumAylar(), cur = curKey();
+  const [idx,setIdx] = useState(()=>Math.max(0, AYLAR.findIndex(a=>a.key===cur)));
+  const [filtre,setFiltre] = useState("tumu");
+  const [tutarStr,setTutarStr] = useState("");
+  const [uygula,setUygula] = useState(false);
+  const [busy,setBusy] = useState(false);
+  const odemeler = useCol("odemeler"), borclar = useCol("borclar");
+  const ay = AYLAR[idx], key = ay.key, ad = `${MONTH_NAMES[ay.m]} ${ay.y}`, gelecek = key > cur;
+  const aidat = aidatOf(ayarlar, key);
+  useEffect(()=>{ setTutarStr(String(aidat)); setUygula(false); }, [key, aidat]);
 
-  useEffect(()=>onSnapshot(query(collection(db,"giderler"),orderBy("tarih","desc")),
-    snap=>setGiderler(snap.docs.map(x=>({id:x.id,...x.data()})))) ,[]);
+  const om = Object.fromEntries(odemeler.filter(o=>o.donem===key && o.durum==="odendi").map(o=>[o.daire,o]));
+  const eksikOf = id => borclar.filter(b=>b.daire===id && b.donem===key).reduce((a,b)=>a+(b.eksik||0),0);
+  const durumOf = d => om[d.id] ? "odendi" : (key < cur ? "gecikti" : "bekliyor");
+  const rows = daireler.map(d=>({ ...d, durum:durumOf(d) })).filter(d=>filtre==="tumu" || d.durum===filtre);
+  const say = dr => daireler.filter(d=>durumOf(d)===dr).length;
 
-  async function ekle() {
-    if(!form.tutar) return;
-    await addDoc(collection(db,"giderler"),{...form,tutar:Number(form.tutar),olusturuldu:serverTimestamp()});
-    logAction(`Gider eklendi: ${form.kategori} ₺${form.tutar}`, "gider_create");
-    setGoster(false);
-    setForm({kategori:"Elektrik",tutar:"",tarih:new Date().toISOString().slice(0,10),not:""});
+  async function tutarKaydet() {
+    const v = Number(tutarStr);
+    if (tutarStr==="" || !(v>=0)) return alert("Geçerli bir tutar girin.");
+    const hedef = (uygula ? AYLAR.slice(idx) : [ay]).map(a=>a.key);
+    await setDoc(doc(db,"ayarlar","genel"), { aylikAidat:Object.fromEntries(hedef.map(k=>[k,v])) }, { merge:true });
+    logAction(`${ad} aidat tutarı: ₺${v}${uygula?" (sonraki aylar dahil)":""}`, "aidat_update");
+    alert("Kaydedildi.");
   }
 
-  async function sil(id) {
-    if(window.confirm("Silinsin mi?")) {
-      await deleteDoc(doc(db,"giderler",id));
-      logAction(`Gider silindi`, "gider_delete");
-    }
+  async function toggle(d) {
+    if (gelecek || busy) return;
+    setBusy(true);
+    try {
+      const mevcut = om[d.id];
+      if (mevcut) {
+        const gelir = await aidatBul(d.id, key, ad);
+        await deleteDoc(doc(db,"odemeler",mevcut.id));
+        if (gelir) await deleteDoc(doc(db,"gelirler",gelir.id));
+        logAction(`${d.id} ${ad} ödeme iptal`, "odeme_cancel");
+      } else {
+        const tutar = Math.max(0, aidat - eksikOf(d.id)), sakin = sakinAdi(d, key);
+        const ref = await addDoc(collection(db,"odemeler"), { daire:d.id, donem:key, donemAd:ad, tutar, durum:"odendi", tarih:bugun(), sakinAd:sakin, olusturuldu:serverTimestamp() });
+        await addDoc(collection(db,"gelirler"), { kaynak:"aidat", daire:d.id, donem:key, odemeId:ref.id, tutar, tarih:bugun(), not:`${d.id} ${sakin} - ${ad} aidatı`, otomatik:true, olusturuldu:serverTimestamp() });
+        logAction(`${d.id} ${ad} ödeme kaydı`, "odeme_record");
+      }
+    } finally { setBusy(false); }
   }
-
-  const { keys:ayKeys, gecerli:ayGecerli, gorunen } = ayFiltrele(giderler, ay);
-  const topGider = gorunen.reduce((a,k)=>a+(k.tutar||0),0);
-  const donemEtiket = ayGecerli==="tumu" ? "Tüm Zamanlar" : ayAdi(ayGecerli);
 
   return (
     <div>
-      <div style={{...S.metricGrid,gridTemplateColumns:"repeat(2,1fr)",marginBottom:16}}>
-        <MetricCard label="Toplam Gider" val={`₺${fmt(topGider)}`} color="#D85A30" sub={donemEtiket}/>
-        <MetricCard label="Kayıt Sayısı" val={gorunen.length.toString()} color="#6366F1" sub={donemEtiket}/>
-      </div>
-      <button style={{...S.addBtn,marginBottom:12}} onClick={()=>setGoster(true)}>- Gider Ekle</button>
-      {goster&&(
-        <div style={{...S.card,marginBottom:16}}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>➖ Gider Ekle</div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
-            <div><label style={S.label}>Kategori</label>
-              <select style={S.select} value={form.kategori} onChange={e=>setForm(p=>({...p,kategori:e.target.value}))}>
-                {GID_KATS.map(k=><option key={k}>{k}</option>)}
-              </select></div>
-            <div><label style={S.label}>Tutar (₺)</label>
-              <input style={S.input} type="number" placeholder="0" value={form.tutar}
-                onChange={e=>setForm(p=>({...p,tutar:e.target.value}))}/></div>
-            <div><label style={S.label}>Tarih</label>
-              <input style={S.input} type="date" value={form.tarih}
-                onChange={e=>setForm(p=>({...p,tarih:e.target.value}))}/></div>
-            <div><label style={S.label}>Not</label>
-              <input style={S.input} placeholder="Açıklama..." value={form.not}
-                onChange={e=>setForm(p=>({...p,not:e.target.value}))}/></div>
-          </div>
-          <div style={{display:"flex",gap:8}}>
-            <button style={S.addBtn} onClick={ekle}>Ekle</button>
-            <button style={S.filterBtn} onClick={()=>setGoster(false)}>İptal</button>
-          </div>
+      <div style={S.card}>
+        <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",gap:8 }}>
+          <button style={S.arrowBtn} onClick={()=>setIdx(i=>Math.max(0,i-1))}>‹</button>
+          <span style={{ fontSize:17,fontWeight:700 }}>{ad}</span>
+          <button style={S.arrowBtn} onClick={()=>setIdx(i=>Math.min(AYLAR.length-1,i+1))}>›</button>
         </div>
+        <div style={{ marginTop:16,paddingTop:14,borderTop:"1px solid #F3F4F6" }}>
+          <label style={S.label}>Bu ay toplanması gereken aidat (₺)</label>
+          <div style={{ display:"flex",gap:8,marginTop:6 }}>
+            <input style={{ ...S.input,flex:1,fontWeight:700,fontSize:18 }} type="number" inputMode="numeric" value={tutarStr} onChange={e=>setTutarStr(e.target.value)}/>
+            <button style={S.addBtn} onClick={tutarKaydet}>Kaydet</button>
+          </div>
+          <label style={{ display:"flex",gap:8,alignItems:"center",fontSize:12,color:"#6B7280",marginTop:10 }}>
+            <input type="checkbox" checked={uygula} onChange={e=>setUygula(e.target.checked)}/> Sonraki aylara da uygula
+          </label>
+          <div style={{ fontSize:11,color:"#9CA3AF",marginTop:6 }}>Yalnızca bu ayı etkiler; ödenmiş kayıtlar ve önceki aylar değişmez.</div>
+        </div>
+      </div>
+      {gelecek ? (
+        <div style={{ ...S.card,textAlign:"center",padding:"32px 20px" }}><div style={{ fontSize:32 }}>📅</div><div style={{ fontWeight:600,marginTop:6 }}>{ad} henüz gelmedi</div></div>
+      ) : (
+        <>
+          <Chips secili={filtre} onChange={setFiltre} items={[{v:"tumu",l:"Tümü"},{v:"odendi",l:`Ödendi (${say("odendi")})`},{v:"bekliyor",l:`Bekliyor (${say("bekliyor")})`},{v:"gecikti",l:`Gecikmiş (${say("gecikti")})`}]}/>
+          <div style={S.card}>
+            <div style={{ overflowX:"auto" }}>
+              <table style={S.table}>
+                <thead><tr><th style={S.th}>Daire</th><th style={S.th}>Sakin</th><th style={S.th}>Tutar</th><th style={S.th}>Tarih</th><th style={S.th}>Durum</th><th style={S.th}></th></tr></thead>
+                <tbody>{rows.map(d=>(
+                  <tr key={d.id}>
+                    <td style={S.td}><b>{d.id}</b></td>
+                    <td style={S.td}>{sakinAdi(d,key)}</td>
+                    <td style={S.td}>₺{fmt(om[d.id]?om[d.id].tutar:aidat)}{eksikOf(d.id)>0 && <div style={{ fontSize:10,color:"#D85A30" }}>eksik ₺{fmt(eksikOf(d.id))}</div>}</td>
+                    <td style={S.td}>{om[d.id]?.tarih||"—"}</td>
+                    <td style={S.td}><span style={{ ...S.badge,...DURUM_STIL[d.durum] }}>{DURUM_LABEL[d.durum]}</span></td>
+                    <td style={S.td}>
+                      <button style={{ ...S.smallBtn,fontSize:11,borderColor:d.durum==="odendi"?"#fca5a5":"#6ee7b7",color:d.durum==="odendi"?"#991B1B":"#065F46" }} disabled={busy} onClick={()=>toggle(d)}>
+                        {d.durum==="odendi"?"İptal":"✓ Ödendi"}
+                      </button>
+                    </td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          </div>
+        </>
       )}
-      <AyFiltre keys={ayKeys} secili={ayGecerli} onChange={setAy}/>
-      <AyListe kayitlar={gorunen} alan="kategori" renk="#D85A30" isaret="-" bos="Gider yok"
-        etiket={g=>g.kategori} silinebilir={()=>true} onSil={sil}/>
     </div>
   );
 }
 
-// ── TAB: RAPOR ────────────────────────────────────────────────────────────
-function DagilimKart({ baslik, liste, toplam, renk }) {
+// ── GELİR–GİDER (tek sayfa) ───────────────────────────────────────────────
+function Kolon({ baslik, koleksiyon, alan, secenekler, liste, renk, isaret, ay }) {
+  const bos = () => ({ [alan]:secenekler[0], tutar:"", tarih:(ay==="tumu"||ay===curKey())?bugun():`${ay}-01`, not:"" });
+  const [goster,setGoster] = useState(false);
+  const [form,setForm] = useState(bos());
+  const set = (k,v) => setForm(p=>({ ...p,[k]:v }));
+  async function ekle() {
+    if (!form.tutar) return;
+    await addDoc(collection(db,koleksiyon), { ...form, tutar:Number(form.tutar), olusturuldu:serverTimestamp() });
+    logAction(`${baslik}: ${form[alan]} ₺${form.tutar}`, koleksiyon+"_create");
+    setGoster(false);
+  }
+  async function sil(g) {
+    if (!window.confirm(g.otomatik ? "Bu kayıt aidat/borç ödemesiyle oluşmuş. Yine de silinsin mi?" : "Silinsin mi?")) return;
+    await deleteDoc(doc(db,koleksiyon,g.id));
+    logAction(`${baslik} kaydı silindi`, koleksiyon+"_delete");
+  }
   return (
     <div style={S.card}>
-      <div style={S.cardTitle}>{baslik}</div>
-      {liste.length === 0 ? <p style={{ color:"#9CA3AF",padding:"16px 0",fontSize:13 }}>Veri yok</p> :
-        liste.map(([ad, t]) => {
-          const y = toplam ? Math.round(t / toplam * 100) : 0;
-          return (
-            <div key={ad} style={{ marginTop:12 }}>
-              <div style={{ display:"flex",justifyContent:"space-between",fontSize:13 }}>
-                <span style={{ fontWeight:600 }}>{ad}</span>
-                <span style={{ fontWeight:700,color:renk }}>₺{fmt(t)} <span style={{ color:"#9CA3AF",fontWeight:500 }}>%{y}</span></span>
-              </div>
-              <div style={{ ...S.barTrack,marginTop:5 }}><div style={{ ...S.barFill,width:`${y}%`,background:renk }}/></div>
-            </div>
-          );
-        })}
+      <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center" }}>
+        <div style={S.cardTitle}>{baslik}</div>
+        <b style={{ color:renk,fontSize:16 }}>{isaret}₺{fmt(topla(liste))}</b>
+      </div>
+      <button style={{ ...S.addBtn,margin:"12px 0",width:"100%" }} onClick={()=>{ setForm(bos()); setGoster(g=>!g); }}>{goster?"Vazgeç":"+ Ekle"}</button>
+      {goster && (
+        <div style={{ display:"grid",gap:8,marginBottom:14,padding:12,background:"#F9FAFB",borderRadius:12 }}>
+          <select style={S.select} value={form[alan]} onChange={e=>set(alan,e.target.value)}>{secenekler.map(k=><option key={k}>{k}</option>)}</select>
+          <input style={S.input} type="number" inputMode="numeric" placeholder="Tutar (₺)" value={form.tutar} onChange={e=>set("tutar",e.target.value)}/>
+          <input style={S.input} type="date" value={form.tarih} onChange={e=>set("tarih",e.target.value)}/>
+          <input style={S.input} placeholder="Not (isteğe bağlı)" value={form.not} onChange={e=>set("not",e.target.value)}/>
+          <button style={S.addBtn} onClick={ekle}>Kaydet</button>
+        </div>
+      )}
+      {liste.length===0 ? <Bos t="Kayıt yok"/> : liste.map(g=>(
+        <div key={g.id} style={{ padding:"11px 0",borderBottom:"1px solid #F3F4F6",display:"flex",justifyContent:"space-between",alignItems:"center",gap:8 }}>
+          <div style={{ minWidth:0 }}>
+            <div style={{ fontWeight:600,fontSize:13,textTransform:"capitalize" }}>{g[alan]}</div>
+            <div style={{ fontSize:11,color:"#9CA3AF",overflow:"hidden",textOverflow:"ellipsis" }}>{g.tarih}{g.not?` · ${g.not}`:""}</div>
+          </div>
+          <div style={{ display:"flex",alignItems:"center",gap:6,flex:"none" }}>
+            <b style={{ color:renk,fontSize:13 }}>{isaret}₺{fmt(g.tutar)}</b>
+            <button style={{ ...S.delBtn,padding:"4px 8px" }} onClick={()=>sil(g)}>✕</button>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
 
-function TabRapor() {
-  const [gelirler,setGelirler] = useState([]);
-  const [giderler,setGiderler] = useState([]);
-  const [yil,setYil] = useState(CUR_YEAR);
-  const [ay,setAy]   = useState("tumu");
-
-  useEffect(()=>{
-    const a=onSnapshot(query(collection(db,"gelirler"),orderBy("tarih","desc")),sn=>setGelirler(sn.docs.map(x=>({id:x.id,...x.data()}))));
-    const b=onSnapshot(query(collection(db,"giderler"),orderBy("tarih","desc")),sn=>setGiderler(sn.docs.map(x=>({id:x.id,...x.data()}))));
-    return()=>{a();b();};
-  },[]);
-
-  const sum = l => l.reduce((t,k)=>t+(k.tutar||0),0);
-  const yillar = [...new Set([CUR_YEAR,...[...gelirler,...giderler].map(k=>Number(ayOf(k.tarih).slice(0,4))).filter(Boolean)])].sort((a,b)=>b-a);
-  const mKey = m => `${yil}-${String(m+1).padStart(2,"0")}`;
-  const secili = k => ayOf(k.tarih).startsWith(`${yil}-`) && (ay==="tumu" || ayOf(k.tarih)===mKey(ay));
-  const gel = gelirler.filter(secili), gid = giderler.filter(secili);
-  const tG = sum(gel), tD = sum(gid), net = tG - tD;
-  const aylik = MONTHS_SHORT.map((ad,m)=>{
-    const g = sum(gelirler.filter(k=>ayOf(k.tarih)===mKey(m))), d = sum(giderler.filter(k=>ayOf(k.tarih)===mKey(m)));
-    return { m, ad, Gelir:g, Gider:d, Net:g-d };
-  });
-  const dagilim = (l,alan) => {
-    const o={}; l.forEach(k=>{const e=k[alan]||"Diğer"; o[e]=(o[e]||0)+(k.tutar||0);});
-    return Object.entries(o).sort((a,b)=>b[1]-a[1]);
-  };
-  const donem = ay==="tumu" ? `${yil} · Tüm yıl` : `${MONTH_NAMES[ay]} ${yil}`;
-  const dolu = aylik.filter(r=>r.Gelir||r.Gider);
-
+function TabGelirGider() {
+  const gelirler = useCol("gelirler","tarih"), giderler = useCol("giderler","tarih");
+  const cur = curKey();
+  const [ay,setAy] = useState(cur);
+  const keys = [...new Set([cur, ...gelirler.map(k=>ayOf(k.tarih)), ...giderler.map(k=>ayOf(k.tarih))])].filter(Boolean).sort().reverse();
+  const sec = ay==="tumu" || keys.includes(ay) ? ay : "tumu";
+  const f = l => sec==="tumu" ? l : l.filter(k=>ayOf(k.tarih)===sec);
+  const gel = f(gelirler), gid = f(giderler), net = topla(gel) - topla(gid);
   return (
     <div>
-      <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap" }}>
-        <div style={{ fontSize:18,fontWeight:700 }}>📑 Gelir–Gider Raporu</div>
-        <button className="no-print" style={S.addBtn} onClick={()=>window.print()}>🖨️ Yazdır / PDF</button>
+      <div style={{ display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginBottom:14 }}>
+        <select style={{ ...S.select,width:"auto",minWidth:190,fontWeight:700 }} value={sec} onChange={e=>setAy(e.target.value)}>
+          <option value="tumu">Tüm aylar</option>
+          {keys.map(k=><option key={k} value={k}>{ayAdi(k)}</option>)}
+        </select>
+        <span style={{ ...S.badge,background:net>=0?"#D1FAE5":"#FEE2E2",color:net>=0?"#065F46":"#991B1B",fontSize:13 }}>Net: {net<0?"-":""}₺{fmt(Math.abs(net))}</span>
       </div>
-      <Chips secili={yil} onChange={v=>{setYil(v);setAy("tumu");}} items={yillar.map(y=>({v:y,l:String(y)}))}/>
-      <Chips secili={ay} onChange={setAy} items={[{v:"tumu",l:"Tüm yıl"},...MONTHS_SHORT.map((l,m)=>({v:m,l}))]}/>
-
-      <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12,marginBottom:16 }}>
-        <MetricCard label="Toplam Gelir" val={`₺${fmt(tG)}`} color="#1D9E75" sub={donem}/>
-        <MetricCard label="Toplam Gider" val={`₺${fmt(tD)}`} color="#D85A30" sub={donem}/>
-        <MetricCard label="Net Bakiye" val={`${net<0?"-":""}₺${fmt(Math.abs(net))}`} color={net>=0?"#1D9E75":"#D85A30"} sub={net>=0?"Fazla":"Açık"}/>
-      </div>
-
-      <div style={S.card}>
-        <div style={S.cardTitle}>📊 {yil} Aylık Karşılaştırma</div>
-        <ResponsiveContainer width="100%" height={240}>
-          <BarChart data={aylik}><CartesianGrid strokeDasharray="3 3" stroke="#F3F4F6" vertical={false}/>
-            <XAxis dataKey="ad" fontSize={11} tickLine={false}/><YAxis fontSize={11} tickLine={false} axisLine={false}/>
-            <Tooltip formatter={v=>`₺${fmt(v)}`}/><Legend/>
-            <Bar dataKey="Gelir" fill="#1D9E75" radius={[6,6,0,0]}/><Bar dataKey="Gider" fill="#D85A30" radius={[6,6,0,0]}/>
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-
-      <div style={S.card}>
-        <div style={S.cardTitle}>🗓️ Aylık Döküm</div>
-        {dolu.length===0 ? <p style={{ color:"#9CA3AF",padding:"16px 0",fontSize:13 }}>{yil} için kayıt yok</p> : (
-          <div style={{ overflowX:"auto" }}>
-            <table style={S.table}>
-              <thead><tr><th style={S.th}>Ay</th><th style={{...S.th,textAlign:"right"}}>Gelir</th><th style={{...S.th,textAlign:"right"}}>Gider</th><th style={{...S.th,textAlign:"right"}}>Net</th></tr></thead>
-              <tbody>
-                {dolu.map(r=>(
-                  <tr key={r.m} onClick={()=>setAy(r.m)} style={{ cursor:"pointer",background:ay===r.m?"#ECFDF5":"transparent" }}>
-                    <td style={S.td}><b>{MONTH_NAMES[r.m]}</b></td>
-                    <td style={{...S.td,textAlign:"right",color:"#1D9E75"}}>₺{fmt(r.Gelir)}</td>
-                    <td style={{...S.td,textAlign:"right",color:"#D85A30"}}>₺{fmt(r.Gider)}</td>
-                    <td style={{...S.td,textAlign:"right",fontWeight:700,color:r.Net>=0?"#1D9E75":"#D85A30"}}>{r.Net<0?"-":""}₺{fmt(Math.abs(r.Net))}</td>
-                  </tr>
-                ))}
-                <tr>
-                  <td style={{...S.td,fontWeight:700,borderBottom:"none"}}>Toplam</td>
-                  <td style={{...S.td,textAlign:"right",fontWeight:700,borderBottom:"none"}}>₺{fmt(sum(dolu.map(r=>({tutar:r.Gelir}))))}</td>
-                  <td style={{...S.td,textAlign:"right",fontWeight:700,borderBottom:"none"}}>₺{fmt(sum(dolu.map(r=>({tutar:r.Gider}))))}</td>
-                  <td style={{...S.td,textAlign:"right",fontWeight:700,borderBottom:"none"}}>₺{fmt(sum(dolu.map(r=>({tutar:r.Net}))))}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      <div className="two-col" style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12 }}>
-        <DagilimKart baslik={`💰 Gelir Kaynakları · ${donem}`} liste={dagilim(gel,"kaynak")} toplam={tG} renk="#1D9E75"/>
-        <DagilimKart baslik={`📉 Gider Kategorileri · ${donem}`} liste={dagilim(gid,"kategori")} toplam={tD} renk="#D85A30"/>
+      <div className="two-col" style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,alignItems:"start" }}>
+        <Kolon baslik="💰 Gelirler" koleksiyon="gelirler" alan="kaynak" secenekler={["aidat","kira","bağış","borç tahsilatı","diğer"]} liste={gel} renk="#1D9E75" isaret="+" ay={sec}/>
+        <Kolon baslik="📉 Giderler" koleksiyon="giderler" alan="kategori" secenekler={GID_KATS} liste={gid} renk="#D85A30" isaret="-" ay={sec}/>
       </div>
     </div>
   );
 }
 
-// ── TAB: DUYURU ───────────────────────────────────────────────────────────
-function TabDuyuru() {
-  const [duyurular,setDuyurular] = useState([]);
-  const [form,setForm] = useState({baslik:"",icerik:"",kategori:"Bilgi"});
+// ── BORÇLAR ───────────────────────────────────────────────────────────────
+function TabBorclar({ daireler }) {
+  const borclar = useCol("borclar"), odemeler = useCol("odemeler");
+  const AYLAR = gecmisAylar().reverse(), cur = curKey();
+  const [f,setF] = useState("acik");
   const [goster,setGoster] = useState(false);
-
-  useEffect(()=>onSnapshot(query(collection(db,"duyurular"),orderBy("tarih","desc")),
-    snap=>setDuyurular(snap.docs.map(x=>({id:x.id,...x.data()})))) ,[]);
-
+  const [form,setForm] = useState({ daire:"D1", donem:cur, eksik:"", not:"" });
+  const kalanOf = b => Math.max(0,(b.eksik||0)-(b.odenen||0));
+  const dMap = Object.fromEntries(daireler.map(d=>[d.id,d]));
+  const odemeBul = (daire,donem) => odemeler.find(o=>o.daire===daire && o.donem===donem && o.durum==="odendi");
+  async function duzelt(daire, donem, adAy, fark) { // ödenmiş aidat ve gelir kaydını eksik tutar kadar düzeltir
+    const od = odemeBul(daire, donem); if (!od) return;
+    await updateDoc(doc(db,"odemeler",od.id), { tutar:increment(fark) });
+    const g = await aidatBul(daire, donem, adAy);
+    if (g) await updateDoc(doc(db,"gelirler",g.id), { tutar:increment(fark) });
+  }
   async function ekle() {
-    if(!form.baslik||!form.icerik) return;
-    await addDoc(collection(db,"duyurular"),{...form,tarih:new Date().toISOString().slice(0,10),olusturuldu:serverTimestamp()});
-    logAction(`Duyuru eklendi: ${form.baslik}`, "duyuru_create");
-    setGoster(false);
-    setForm({baslik:"",icerik:"",kategori:"Bilgi"});
+    const eksik = Number(form.eksik);
+    if (!(eksik>0)) return alert("Eksik tutarı girin.");
+    const a = AYLAR.find(x=>x.key===form.donem), adAy = `${MONTH_NAMES[a.m]} ${a.y}`;
+    await addDoc(collection(db,"borclar"), { daire:form.daire, donem:form.donem, donemAd:adAy, eksik, odenen:0, not:form.not, tarih:bugun(), olusturuldu:serverTimestamp() });
+    await duzelt(form.daire, form.donem, adAy, -eksik);
+    logAction(`${form.daire} ${adAy} eksik ödeme: ₺${eksik}`, "borc_create");
+    setGoster(false); setForm(p=>({ ...p,eksik:"",not:"" }));
   }
-
-  async function sil(id) {
-    if(window.confirm("Silinsin mi?")) {
-      await deleteDoc(doc(db,"duyurular",id));
-      logAction(`Duyuru silindi`, "duyuru_delete");
-    }
+  async function tahsilat(b) {
+    const k = kalanOf(b), v = Number(window.prompt(`Tahsil edilen tutar (kalan ₺${fmt(k)}):`, k));
+    if (!(v>0)) return;
+    await updateDoc(doc(db,"borclar",b.id), { odenen:increment(v) });
+    await addDoc(collection(db,"gelirler"), { kaynak:"borç tahsilatı", daire:b.daire, borcId:b.id, tutar:v, tarih:bugun(), not:`${b.daire} - ${b.donemAd} eksik aidat tahsilatı`, otomatik:true, olusturuldu:serverTimestamp() });
+    logAction(`${b.daire} ${b.donemAd} borç tahsilatı ₺${v}`, "borc_tahsilat");
   }
-
+  async function sil(b) {
+    if (!window.confirm("Borç kaydı silinsin mi? (Yapılmış tahsilatlar gelirde kalır)")) return;
+    if (kalanOf(b)>0) await duzelt(b.daire, b.donem, b.donemAd, kalanOf(b));
+    await deleteDoc(doc(db,"borclar",b.id));
+    logAction(`${b.daire} ${b.donemAd} borç kaydı silindi`, "borc_delete");
+  }
+  const liste = borclar.filter(b=>f==="tumu" || (f==="acik"?kalanOf(b)>0:kalanOf(b)===0))
+    .sort((a,b)=>String(b.donem).localeCompare(String(a.donem)));
+  const acik = borclar.reduce((a,b)=>a+kalanOf(b),0);
   return (
     <div>
-      <button style={{...S.addBtn,marginBottom:12}} onClick={()=>setGoster(true)}>+ Duyuru Ekle</button>
-      {goster&&(
-        <div style={{...S.card,marginBottom:16}}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>📢 Duyuru Ekle</div>
-          <div style={S.field}><label style={S.label}>Başlık</label>
-            <input style={S.input} value={form.baslik} onChange={e=>setForm(p=>({...p,baslik:e.target.value}))} placeholder="Başlık"/></div>
-          <div style={S.field}><label style={S.label}>İçerik</label>
-            <textarea style={{...S.input,height:80}} value={form.icerik}
-              onChange={e=>setForm(p=>({...p,icerik:e.target.value}))} placeholder="İçerik..."/></div>
-          <div style={S.field}><label style={S.label}>Kategori</label>
-            <select style={S.select} value={form.kategori} onChange={e=>setForm(p=>({...p,kategori:e.target.value}))}>
-              {["Bilgi","Bakım","Aidat","Toplantı","Acil"].map(k=><option key={k}>{k}</option>)}
-            </select></div>
-          <div style={{display:"flex",gap:8}}>
-            <button style={S.addBtn} onClick={ekle}>Yayınla</button>
-            <button style={S.filterBtn} onClick={()=>setGoster(false)}>İptal</button>
+      <div className="metric-grid" style={{ ...S.metricGrid,gridTemplateColumns:"repeat(2,1fr)" }}>
+        <MetricCard label="Açık Borç" val={`₺${fmt(acik)}`} color={acik?"#D85A30":"#1D9E75"} sub={`${borclar.filter(b=>kalanOf(b)>0).length} kayıt`}/>
+        <MetricCard label="Tahsil Edilen" val={`₺${fmt(topla(borclar.map(b=>({tutar:b.odenen}))))}`} color="#1D9E75"/>
+      </div>
+      <button style={{ ...S.addBtn,marginBottom:12 }} onClick={()=>setGoster(g=>!g)}>{goster?"Vazgeç":"+ Eksik Ödeme Ekle"}</button>
+      {goster && (
+        <div style={S.card}>
+          <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:8 }}>
+            <div><label style={S.label}>Daire</label>
+              <select style={S.select} value={form.daire} onChange={e=>setForm(p=>({...p,daire:e.target.value}))}>
+                {daireler.map(d=><option key={d.id} value={d.id}>{d.id} · {sakinAdi(d,form.donem)}</option>)}</select></div>
+            <div><label style={S.label}>Ay</label>
+              <select style={S.select} value={form.donem} onChange={e=>setForm(p=>({...p,donem:e.target.value}))}>
+                {AYLAR.map(a=><option key={a.key} value={a.key}>{MONTH_NAMES[a.m]} {a.y}</option>)}</select></div>
+            <div><label style={S.label}>Eksik alınan tutar (₺)</label>
+              <input style={S.input} type="number" inputMode="numeric" value={form.eksik} onChange={e=>setForm(p=>({...p,eksik:e.target.value}))}/></div>
+            <div><label style={S.label}>Not</label>
+              <input style={S.input} placeholder="Örn: kalanı gelecek ay" value={form.not} onChange={e=>setForm(p=>({...p,not:e.target.value}))}/></div>
           </div>
+          <div style={{ fontSize:11,color:"#9CA3AF",margin:"10px 0" }}>O ay aidatı “Ödendi” işaretliyse gelir, eksik tutar kadar otomatik düşülür; tahsil edilince gelire eklenir.</div>
+          <button style={S.addBtn} onClick={ekle}>Kaydet</button>
         </div>
       )}
+      <Chips secili={f} onChange={setF} items={[{v:"acik",l:"Açık"},{v:"kapali",l:"Kapanan"},{v:"tumu",l:"Tümü"}]}/>
       <div style={S.card}>
-        {duyurular.length===0?<p style={{color:"#9CA3AF"}}>Duyuru yok</p>:
-          duyurular.map(du=>(
-            <div key={du.id} style={{padding:"12px 0",borderBottom:"1px solid #F3F4F6"}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"start",gap:8}}>
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:600,color:"#111"}}>{du.baslik}</div>
-                  <div style={{fontSize:12,color:"#6B7280",marginTop:4}}>{du.icerik}</div>
-                  <div style={{fontSize:10,color:"#9CA3AF",marginTop:4}}>{du.tarih}</div>
-                </div>
-                <button style={{...S.delBtn}} onClick={()=>sil(du.id)}>✕</button>
+        {liste.length===0 ? <Bos t="Kayıt yok"/> : liste.map(b=>(
+          <div key={b.id} style={{ padding:"12px 0",borderBottom:"1px solid #F3F4F6" }}>
+            <div style={{ display:"flex",justifyContent:"space-between",gap:8 }}>
+              <div><b>{b.daire}</b> · {dMap[b.daire]?sakinAdi(dMap[b.daire],b.donem):""}<div style={{ fontSize:11,color:"#9CA3AF" }}>{b.donemAd}{b.not?` · ${b.not}`:""}</div></div>
+              <div style={{ textAlign:"right" }}>
+                <b style={{ color:kalanOf(b)?"#D85A30":"#1D9E75" }}>{kalanOf(b)?`₺${fmt(kalanOf(b))} kalan`:"Kapandı"}</b>
+                <div style={{ fontSize:11,color:"#9CA3AF" }}>Eksik ₺{fmt(b.eksik)} · Alınan ₺{fmt(b.odenen)}</div>
               </div>
             </div>
-          ))
-        }
-      </div>
-    </div>
-  );
-}
-
-// ── TAB: MESAJ ────────────────────────────────────────────────────────────
-function TabMesaj({ daireler }) {
-  const [mesajlar,setMesajlar] = useState([]);
-  const [form,setForm] = useState({alici:"Tüm sakinler",baslik:"",icerik:""});
-  const [goster,setGoster] = useState(false);
-
-  useEffect(()=>onSnapshot(query(collection(db,"messages"),orderBy("olusturuldu","desc")),
-    snap=>setMesajlar(snap.docs.map(x=>({id:x.id,...x.data()})))) ,[]);
-
-  async function gonder() {
-    if(!form.baslik||!form.icerik) return;
-    await addDoc(collection(db,"messages"),{...form,tarih:new Date().toISOString().slice(0,10),olusturuldu:serverTimestamp()});
-    logAction(`${form.alici}'ye mesaj: ${form.baslik}`, "mesaj_send");
-    setGoster(false);
-    setForm({alici:"Tüm sakinler",baslik:"",icerik:""});
-  }
-
-  return (
-    <div>
-      <button style={{...S.addBtn,marginBottom:12}} onClick={()=>setGoster(true)}>+ Mesaj Gönder</button>
-      {goster&&(
-        <div style={{...S.card,marginBottom:16}}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>💬 Mesaj Gönder</div>
-          <div style={S.field}><label style={S.label}>Alıcı</label>
-            <select style={S.select} value={form.alici} onChange={e=>setForm(p=>({...p,alici:e.target.value}))}>
-              {["Tüm sakinler",...daireler.map(d=>`${d.id} · ${d.sakinAd||d.ad}`)].map(o=><option key={o}>{o}</option>)}
-            </select></div>
-          <div style={S.field}><label style={S.label}>Başlık</label>
-            <input style={S.input} value={form.baslik} onChange={e=>setForm(p=>({...p,baslik:e.target.value}))} placeholder="Başlık"/></div>
-          <div style={S.field}><label style={S.label}>İçerik</label>
-            <textarea style={{...S.input,height:100}} value={form.icerik}
-              onChange={e=>setForm(p=>({...p,icerik:e.target.value}))} placeholder="İçerik..."/></div>
-          <div style={{display:"flex",gap:8}}>
-            <button style={S.addBtn} onClick={gonder}>Gönder</button>
-            <button style={S.filterBtn} onClick={()=>setGoster(false)}>İptal</button>
-          </div>
-        </div>
-      )}
-      <div style={S.card}>
-        {mesajlar.length===0?<p style={{color:"#9CA3AF"}}>Mesaj yok</p>:
-          mesajlar.map(m=>(
-            <div key={m.id} style={{padding:"12px 0",borderBottom:"1px solid #F3F4F6"}}>
-              <div style={{fontWeight:600,color:"#111"}}>{m.baslik}</div>
-              <div style={{fontSize:12,color:"#9CA3AF",marginTop:2}}>→ {m.alici}</div>
-              <div style={{fontSize:12,color:"#6B7280",marginTop:4}}>{m.icerik}</div>
-              <div style={{fontSize:10,color:"#D1D5DB",marginTop:4}}>{m.tarih}</div>
+            <div style={{ display:"flex",gap:8,marginTop:8 }}>
+              {kalanOf(b)>0 && <button style={{ ...S.smallBtn,borderColor:"#6ee7b7",color:"#065F46",fontSize:12 }} onClick={()=>tahsilat(b)}>+ Tahsilat</button>}
+              <button style={{ ...S.delBtn,padding:"6px 10px" }} onClick={()=>sil(b)}>Sil</button>
             </div>
-          ))
-        }
-      </div>
-    </div>
-  );
-}
-
-// ── TAB: AYARLAR ──────────────────────────────────────────────────────────
-function TabAyarlar({ ayarlar, daireler }) {
-  const [altTab,setAltTab] = useState("aidat");
-  const [aidatTutar,setAidatTutar] = useState(ayarlar?.aidatTutar||2500);
-  const [auditLogs,setAuditLogs] = useState([]);
-  const [seciliDaire,setSeciliDaire] = useState(null);
-  const [daireForm,setDaireForm] = useState({});
-
-  useEffect(()=>onSnapshot(query(collection(db,"auditLog"),orderBy("olusturuldu","desc")),
-    snap=>setAuditLogs(snap.docs.map(x=>({id:x.id,...x.data()})))), []);
-
-  async function aidatKaydet() {
-    await setDoc(doc(db,"ayarlar","genel"),{...ayarlar,aidatTutar:Number(aidatTutar)});
-    logAction(`Aidat: ₺${aidatTutar}`, "aidat_update");
-    alert("Kaydedildi!");
-  }
-
-  function daireSecDuzenle(d) {
-    setSeciliDaire(d);
-    setDaireForm({sakinAd:d.sakinAd||"",tel:d.tel||""});
-  }
-
-  async function daireKaydet() {
-    if(!seciliDaire) return;
-    await updateDoc(doc(db,"daireler",seciliDaire.id),daireForm);
-    logAction(`${seciliDaire.id} güncellendi: ${daireForm.sakinAd}`, "daire_update");
-    setSeciliDaire(null);
-    alert("Kaydedildi!");
-  }
-
-  return (
-    <div>
-      <div style={{display:"flex",gap:6,marginBottom:16}}>
-        {[{id:"aidat",label:"💰 Aidat Tutarı"},{id:"daireler",label:"🏠 Daire Kullanıcıları"},{id:"audit",label:"📜 Denetim Logu"}].map(t=>(
-          <button key={t.id} style={{...S.filterBtn,...(altTab===t.id?S.filterActive:{})}}
-            onClick={()=>setAltTab(t.id)}>{t.label}</button>
+          </div>
         ))}
       </div>
+    </div>
+  );
+}
 
-      {altTab==="aidat"&&(
-        <div style={S.card}>
-          <div style={S.cardTitle}>💰 Aidat Tutarı</div>
-          <div style={{display:"flex",gap:8,alignItems:"flex-end",marginTop:12}}>
-            <input style={{...S.input,fontSize:22,fontWeight:700,flex:1}} type="number"
-              value={aidatTutar} onChange={e=>setAidatTutar(e.target.value)}/>
-            <button style={S.addBtn} onClick={aidatKaydet}>Kaydet</button>
-          </div>
-        </div>
+// ── RAPOR (PDF çıktısı) ───────────────────────────────────────────────────
+function TabRapor({ daireler }) {
+  const odemeler = useCol("odemeler"), gelirler = useCol("gelirler","tarih"), giderler = useCol("giderler","tarih"), borclar = useCol("borclar");
+  const [yil,setYil] = useState(CUR_YEAR);
+  const [ay,setAy] = useState("tumu");
+  const mKey = m => `${yil}-${String(m+1).padStart(2,"0")}`;
+  const bas = ay==="tumu" ? mKey(0) : mKey(ay), son = ay==="tumu" ? mKey(11) : mKey(ay);
+  const inP = key => key >= bas && key <= son;
+  const yillar = [...new Set([CUR_YEAR, ...[...gelirler,...giderler].map(k=>Number(ayOf(k.tarih).slice(0,4))).filter(Boolean)])].sort((a,b)=>b-a);
+  const gel = gelirler.filter(k=>inP(ayOf(k.tarih))), gid = giderler.filter(k=>inP(ayOf(k.tarih)));
+  const tG = topla(gel), tD = topla(gid), net = tG - tD;
+  const donem = ay==="tumu" ? `${yil} yılı` : `${MONTH_NAMES[ay]} ${yil}`;
+  const aylik = MONTH_NAMES.map((ad,m)=>({ m, ad,
+    g:topla(gelirler.filter(k=>ayOf(k.tarih)===mKey(m))), d:topla(giderler.filter(k=>ayOf(k.tarih)===mKey(m))) })).filter(r=>r.g||r.d);
+  const daireRows = daireler.map(d=>{
+    const aidatOd = odemeler.filter(o=>o.daire===d.id && o.durum==="odendi" && inP(o.donem));
+    const tahs = gelirler.filter(g=>g.daire===d.id && g.kaynak==="borç tahsilatı" && inP(ayOf(g.tarih)));
+    const acik = borclar.filter(b=>b.daire===d.id && inP(b.donem)).reduce((a,b)=>a+Math.max(0,(b.eksik||0)-(b.odenen||0)),0);
+    return { d, ay:aidatOd.length, toplam:topla(aidatOd)+topla(tahs), acik };
+  });
+  const th = { ...S.th,textAlign:"right" }, tdr = { ...S.td,textAlign:"right" };
+  const Liste = ({ baslik, liste, alan, renk }) => (
+    <div style={S.card}>
+      <div style={S.cardTitle}>{baslik}</div>
+      {liste.length===0 ? <Bos t="Kayıt yok"/> : (
+        <table style={S.table}><thead><tr><th style={S.th}>Tarih</th><th style={S.th}>Kalem</th><th style={S.th}>Açıklama</th><th style={th}>Tutar</th></tr></thead>
+          <tbody>{liste.map(g=>(<tr key={g.id}><td style={S.td}>{g.tarih}</td><td style={{ ...S.td,textTransform:"capitalize" }}>{g[alan]}</td><td style={S.td}>{g.not||"—"}</td><td style={{ ...tdr,color:renk }}>₺{fmt(g.tutar)}</td></tr>))}
+            <tr><td style={{ ...S.td,fontWeight:700,borderBottom:"none" }} colSpan={3}>Toplam</td><td style={{ ...tdr,fontWeight:700,borderBottom:"none" }}>₺{fmt(topla(liste))}</td></tr></tbody></table>
       )}
+    </div>
+  );
+  return (
+    <div className="rapor">
+      <div className="print-only" style={{ marginBottom:14 }}>
+        <div style={{ fontSize:20,fontWeight:700 }}>{APT_ADI}</div>
+        <div style={{ fontSize:13 }}>Gelir–Gider Raporu · {donem} · Çıktı tarihi: {bugun()}</div>
+      </div>
+      <div className="no-print" style={{ display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap" }}>
+        <div style={{ fontSize:18,fontWeight:700 }}>📑 Rapor · {donem}</div>
+        <button style={S.addBtn} onClick={()=>window.print()}>📄 PDF / Yazdır</button>
+      </div>
+      <Chips secili={yil} onChange={v=>{ setYil(v); setAy("tumu"); }} items={yillar.map(y=>({v:y,l:String(y)}))}/>
+      <Chips secili={ay} onChange={setAy} items={[{v:"tumu",l:"Tüm yıl"}, ...MONTHS_SHORT.map((l,m)=>({v:m,l}))]}/>
+      <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:12,marginBottom:16 }}>
+        <MetricCard label="Toplam Gelir" val={`₺${fmt(tG)}`} color="#1D9E75"/>
+        <MetricCard label="Toplam Gider" val={`₺${fmt(tD)}`} color="#D85A30"/>
+        <MetricCard label="Net" val={`${net<0?"-":""}₺${fmt(Math.abs(net))}`} color={net>=0?"#1D9E75":"#D85A30"}/>
+      </div>
+      <div style={S.card}>
+        <div style={S.cardTitle}>🗓️ {yil} Aylık Özet</div>
+        {aylik.length===0 ? <Bos t="Kayıt yok"/> : (
+          <table style={S.table}><thead><tr><th style={S.th}>Ay</th><th style={th}>Gelir</th><th style={th}>Gider</th><th style={th}>Net</th></tr></thead>
+            <tbody>{aylik.map(r=>(<tr key={r.m} onClick={()=>setAy(r.m)} style={{ cursor:"pointer",background:ay===r.m?"#ECFDF5":"transparent" }}>
+              <td style={S.td}><b>{r.ad}</b></td><td style={{ ...tdr,color:"#1D9E75" }}>₺{fmt(r.g)}</td><td style={{ ...tdr,color:"#D85A30" }}>₺{fmt(r.d)}</td>
+              <td style={{ ...tdr,fontWeight:700 }}>{r.g-r.d<0?"-":""}₺{fmt(Math.abs(r.g-r.d))}</td></tr>))}</tbody></table>
+        )}
+      </div>
+      <div style={S.card}>
+        <div style={S.cardTitle}>🏠 Daire Bazlı Ödemeler · {donem}</div>
+        <table style={S.table}><thead><tr><th style={S.th}>Daire</th><th style={S.th}>Sakin</th><th style={th}>Aidat (ay)</th><th style={th}>Toplam Ödenen</th><th style={th}>Açık Borç</th></tr></thead>
+          <tbody>{daireRows.map(r=>(<tr key={r.d.id}>
+            <td style={S.td}><b>{r.d.id}</b></td><td style={S.td}>{sakinlar(r.d,bas,son)}</td><td style={tdr}>{r.ay}</td>
+            <td style={{ ...tdr,fontWeight:700,color:"#1D9E75" }}>₺{fmt(r.toplam)}</td><td style={{ ...tdr,color:r.acik?"#D85A30":"#9CA3AF" }}>{r.acik?`₺${fmt(r.acik)}`:"—"}</td></tr>))}
+            <tr><td style={{ ...S.td,fontWeight:700,borderBottom:"none" }} colSpan={3}>Toplam</td>
+              <td style={{ ...tdr,fontWeight:700,borderBottom:"none" }}>₺{fmt(daireRows.reduce((a,r)=>a+r.toplam,0))}</td>
+              <td style={{ ...tdr,fontWeight:700,borderBottom:"none" }}>₺{fmt(daireRows.reduce((a,r)=>a+r.acik,0))}</td></tr></tbody></table>
+      </div>
+      <Liste baslik={`💰 Gelir Kalemleri · ${donem}`} liste={gel} alan="kaynak" renk="#1D9E75"/>
+      <Liste baslik={`📉 Gider Kalemleri · ${donem}`} liste={gid} alan="kategori" renk="#D85A30"/>
+    </div>
+  );
+}
 
-      {altTab==="daireler"&&(
+// ── AYARLAR: Daire sakinleri + denetim logu ───────────────────────────────
+function TabAyarlar({ daireler }) {
+  const [alt,setAlt] = useState("daireler");
+  const logs = useCol("auditLog","olusturuldu");
+  const [sec,setSec] = useState(null);
+  const [mod,setMod] = useState("degistir");
+  const [f,setF] = useState({ ad:"", tel:"", bas:curKey() });
+  const cur = curKey(), AYLAR = tumAylar();
+  function ac(d, m) { setSec(d); setMod(m); setF({ ad:m==="duzenle"?sakinAdi(d,cur):"", tel:m==="duzenle"?(d.tel||""):"", bas:cur }); }
+  async function kaydet() {
+    const ad = f.ad.trim();
+    if (!ad) return alert("Sakin adını girin.");
+    const g = sec.sakinGecmis?.length ? [...sec.sakinGecmis] : [{ ad:sec.sakinAd||sec.ad, baslangic:"0000-00" }];
+    let yeni;
+    if (mod==="duzenle") { // yazım düzeltmesi: şu an geçerli kaydın adını düzeltir
+      const i = g.reduce((acc,e,ix)=>e.baslangic<=cur?ix:acc, 0);
+      yeni = g.map((e,ix)=>ix===i?{ ...e, ad }:e);
+    } else { // sakin değişimi: eski kayıtlar korunur, yeni ad seçilen aydan itibaren geçerli
+      yeni = [...g.filter(e=>e.baslangic!==f.bas), { ad, baslangic:f.bas }].sort((a,b)=>a.baslangic.localeCompare(b.baslangic));
+    }
+    await updateDoc(doc(db,"daireler",sec.id), { sakinGecmis:yeni, sakinAd:sakinAdi({ ...sec, sakinGecmis:yeni }, cur), tel:f.tel });
+    logAction(`${sec.id} ${mod==="duzenle"?"düzeltme":"sakin değişimi"}: ${ad}${mod==="degistir"?` (${ayAdi(f.bas)}'den itibaren)`:""}`, "daire_update");
+    setSec(null);
+  }
+  return (
+    <div>
+      <Chips secili={alt} onChange={setAlt} items={[{v:"daireler",l:"🏠 Daire Sakinleri"},{v:"audit",l:"📜 Denetim Logu"}]}/>
+      {alt==="daireler" && (
         <>
-          {seciliDaire&&(
-            <div style={{...S.card,marginBottom:16,borderLeft:"3px solid #1D9E75"}}>
-              <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>✏️ {seciliDaire.id} · {seciliDaire.ad}</div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-                <div><label style={S.label}>Sakin Adı Soyadı</label>
-                  <input style={S.input} placeholder="Ad Soyad" value={daireForm.sakinAd}
-                    onChange={e=>setDaireForm(p=>({...p,sakinAd:e.target.value}))}/></div>
-                <div><label style={S.label}>Telefon</label>
-                  <input style={S.input} placeholder="05xx xxx xx xx" value={daireForm.tel}
-                    onChange={e=>setDaireForm(p=>({...p,tel:e.target.value}))}/></div>
+          {sec && (
+            <div style={{ ...S.card,borderLeft:"3px solid #1D9E75" }}>
+              <div style={{ fontWeight:700,marginBottom:12 }}>{sec.id} · {mod==="duzenle"?"Bilgi düzelt":"Sakin değiştir"}</div>
+              <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:8 }}>
+                <div><label style={S.label}>{mod==="duzenle"?"Ad Soyad":"Yeni sakin adı"}</label><input style={S.input} value={f.ad} onChange={e=>setF(p=>({...p,ad:e.target.value}))}/></div>
+                <div><label style={S.label}>Telefon</label><input style={S.input} value={f.tel} onChange={e=>setF(p=>({...p,tel:e.target.value}))}/></div>
+                {mod==="degistir" && <div><label style={S.label}>Geçerli olduğu ilk ay</label>
+                  <select style={S.select} value={f.bas} onChange={e=>setF(p=>({...p,bas:e.target.value}))}>{AYLAR.map(a=><option key={a.key} value={a.key}>{MONTH_NAMES[a.m]} {a.y}</option>)}</select></div>}
               </div>
-              <div style={{display:"flex",gap:8,marginTop:12}}>
-                <button style={S.addBtn} onClick={daireKaydet}>Kaydet</button>
-                <button style={S.filterBtn} onClick={()=>setSeciliDaire(null)}>İptal</button>
+              <div style={{ fontSize:11,color:"#9CA3AF",margin:"10px 0" }}>
+                {mod==="degistir" ? "Önceki aylardaki kayıtlar eski sakinin adıyla kalır. " : ""}
+                Giriş şifresi için: Firebase Console → Authentication → Users’tan {sec.email} kullanıcısını silip yeni şifreyle yeniden ekleyin.
               </div>
+              <div style={{ display:"flex",gap:8 }}><button style={S.addBtn} onClick={kaydet}>Kaydet</button><button style={S.filterBtn} onClick={()=>setSec(null)}>İptal</button></div>
             </div>
           )}
           <div style={S.card}>
-            <div style={S.cardTitle}>🏠 Daire Kullanıcıları</div>
+            <div style={S.cardTitle}>🏠 Daire Sakinleri</div>
             <table style={S.table}>
-              <thead><tr>
-                <th style={S.th}>Daire</th><th style={S.th}>Sakin Adı</th>
-                <th style={S.th}>Telefon</th><th style={S.th}>İşlem</th>
-              </tr></thead>
+              <thead><tr><th style={S.th}>Daire</th><th style={S.th}>Sakin</th><th style={S.th}>Telefon</th><th style={S.th}></th></tr></thead>
               <tbody>{daireler.map(d=>(
                 <tr key={d.id}>
                   <td style={S.td}><b>{d.id}</b></td>
-                  <td style={S.td}>{d.sakinAd||<span style={{color:"#9CA3AF"}}>—</span>}</td>
-                  <td style={S.td}>{d.tel||<span style={{color:"#9CA3AF"}}>—</span>}</td>
-                  <td style={S.td}>
-                    <button style={{...S.smallBtn,borderColor:"#93C5FD",color:"#1E40AF",fontSize:11}}
-                      onClick={()=>daireSecDuzenle(d)}>Düzenle</button>
+                  <td style={S.td}>{sakinAdi(d,cur)}{(d.sakinGecmis||[]).length>1 && <div style={{ fontSize:10,color:"#9CA3AF" }}>Önceki: {d.sakinGecmis.filter(e=>e.baslangic<=cur).slice(0,-1).map(e=>e.ad).join(", ")||"—"}</div>}</td>
+                  <td style={S.td}>{d.tel||"—"}</td>
+                  <td style={{ ...S.td,whiteSpace:"nowrap" }}>
+                    <button style={{ ...S.smallBtn,fontSize:11,marginRight:6 }} onClick={()=>ac(d,"duzenle")}>Düzelt</button>
+                    <button style={{ ...S.smallBtn,fontSize:11,borderColor:"#93C5FD",color:"#1E40AF" }} onClick={()=>ac(d,"degistir")}>Sakin Değiştir</button>
                   </td>
                 </tr>
               ))}</tbody>
@@ -1091,24 +766,13 @@ function TabAyarlar({ ayarlar, daireler }) {
           </div>
         </>
       )}
-
-      {altTab==="audit"&&(
+      {alt==="audit" && (
         <div style={S.card}>
-          <div style={S.cardTitle}>📜 Denetim Logu (Son 20)</div>
-          {auditLogs.length===0?<p style={{color:"#9CA3AF",padding:"20px 0"}}>Kayıt yok</p>:
-            <table style={S.table}>
-              <thead><tr>
-                <th style={S.th}>Tarih</th><th style={S.th}>Saat</th><th style={S.th}>Detay</th>
-              </tr></thead>
-              <tbody>{auditLogs.slice(0,20).map(log=>(
-                <tr key={log.id}>
-                  <td style={S.td}>{log.tarih}</td>
-                  <td style={S.td}>{log.saat}</td>
-                  <td style={S.td}>{log.detay}</td>
-                </tr>
-              ))}</tbody>
-            </table>
-          }
+          <div style={S.cardTitle}>📜 Denetim Logu (Son 30)</div>
+          {logs.length===0 ? <Bos t="Kayıt yok"/> : (
+            <table style={S.table}><thead><tr><th style={S.th}>Tarih</th><th style={S.th}>Saat</th><th style={S.th}>Detay</th></tr></thead>
+              <tbody>{logs.slice(0,30).map(l=>(<tr key={l.id}><td style={S.td}>{l.tarih}</td><td style={S.td}>{l.saat}</td><td style={S.td}>{l.detay}</td></tr>))}</tbody></table>
+          )}
         </div>
       )}
     </div>
@@ -1116,76 +780,48 @@ function TabAyarlar({ ayarlar, daireler }) {
 }
 
 // ── DAİRE PANELİ ──────────────────────────────────────────────────────────
-function DairePanel({ daire }) {
-  const [tab,setTab] = useState("aidat");
+function DairePanel({ daire, ayarlar }) {
+  const cur = curKey();
   const [odemeler,setOdemeler] = useState([]);
-  const [duyurular,setDuyurular] = useState([]);
-
+  const [borclar,setBorclar] = useState([]);
   useEffect(()=>{
-    const u1=onSnapshot(query(collection(db,"odemeler"),where("daire","==",daire.id)),
-      snap=>setOdemeler(snap.docs.map(x=>({id:x.id,...x.data()}))
-        .sort((a,b)=>String(b.donem||"").localeCompare(String(a.donem||"")))));
-    const u2=onSnapshot(query(collection(db,"duyurular"),orderBy("tarih","desc")),
-      snap=>setDuyurular(snap.docs.map(x=>({id:x.id,...x.data()}))));
-    return()=>{u1();u2();};
-  },[daire.id]);
-
-  const buAyKey = `${CUR_YEAR}-${String(CUR_MONTH + 1).padStart(2,"0")}`;
-  const buAy = odemeler.find(o=>o.donem===buAyKey);
-  const durum = buAy?.durum||"bekliyor";
-
+    const map = sn => sn.docs.map(x=>({ id:x.id, ...x.data() }));
+    const u1 = onSnapshot(query(collection(db,"odemeler"),where("daire","==",daire.id)), sn=>setOdemeler(map(sn).sort((a,b)=>String(b.donem).localeCompare(String(a.donem)))), e=>console.error(e));
+    const u2 = onSnapshot(query(collection(db,"borclar"),where("daire","==",daire.id)), sn=>setBorclar(map(sn).sort((a,b)=>String(b.donem).localeCompare(String(a.donem)))), e=>console.error(e));
+    return ()=>{ u1(); u2(); };
+  }, [daire.id]);
+  const odendiMi = odemeler.some(o=>o.donem===cur && o.durum==="odendi");
+  const durum = odendiMi ? "odendi" : "bekliyor";
+  const kalan = b => Math.max(0,(b.eksik||0)-(b.odenen||0));
+  const acikBorc = borclar.reduce((a,b)=>a+kalan(b),0);
   return (
     <div style={S.app}>
-      <Topbar title="105 Numara" sub={daire.sakinAd||daire.ad} onCikis={()=>signOut(auth)} />
-      <div style={S.desktopNav}>
-        {[{id:"aidat",icon:"💳",label:"Aidat"},{id:"duyuru",icon:"📢",label:"Duyuru"}].map(t=>(
-          <button key={t.id} style={{...S.navBtn,...(tab===t.id?S.navActive:{})}} onClick={()=>setTab(t.id)}>
-            {t.icon} {t.label}
-          </button>
-        ))}
-      </div>
+      <Topbar title={APT_ADI} sub={`${daire.id} · ${sakinAdi(daire,cur)}`} onCikis={()=>signOut(auth)} />
       <div style={S.content}>
-        <div style={{...S.heroCard,borderLeft:`4px solid ${durum==="odendi"?"#1D9E75":durum==="gecikti"?"#D85A30":"#BA7517"}`}}>
-          <div style={{fontSize:11,color:"#9CA3AF",marginBottom:6,fontWeight:600}}>{MONTH_NAMES[CUR_MONTH]} {CUR_YEAR}</div>
-          <div style={{fontSize:34,fontWeight:700,color:"#111",marginBottom:10}}>₺{fmt(daire.aidat)}</div>
-          <span style={{...S.badge,...(durum==="odendi"?{background:"#D1FAE5",color:"#065F46"}:durum==="gecikti"?{background:"#FEE2E2",color:"#991B1B"}:{background:"#FEF3C7",color:"#92400E"})}}>
-            {DURUM_LABEL[durum]}
-          </span>
+        <div style={{ ...S.heroCard,borderLeft:`4px solid ${odendiMi?"#1D9E75":"#BA7517"}` }}>
+          <div style={{ fontSize:12,color:"#9CA3AF",marginBottom:6,fontWeight:600 }}>{ayAdi(cur)} aidatı</div>
+          <div style={{ fontSize:34,fontWeight:700,marginBottom:10 }}>₺{fmt(aidatOf(ayarlar,cur))}</div>
+          <span style={{ ...S.badge,...DURUM_STIL[durum] }}>{DURUM_LABEL[durum]}</span>
+          {acikBorc>0 && <span style={{ ...S.badge,...DURUM_STIL.gecikti,marginLeft:8 }}>Açık borç ₺{fmt(acikBorc)}</span>}
         </div>
-
-        {tab==="aidat" && (
+        {borclar.length>0 && (
           <div style={S.card}>
-            <div style={S.cardTitle}>📋 Ödeme Geçmişi</div>
-            {odemeler.length===0?<p style={{color:"#9CA3AF",padding:"20px 0"}}>Kayıt yok</p>:
-              <table style={S.table}>
-                <thead><tr><th style={S.th}>Dönem</th><th style={S.th}>Tutar</th><th style={S.th}>Tarih</th><th style={S.th}>Durum</th></tr></thead>
-                <tbody>{odemeler.map(o=>(
-                  <tr key={o.id}>
-                    <td style={S.td}>{o.donemAd||o.donem}</td>
-                    <td style={S.td}>₺{fmt(o.tutar)}</td>
-                    <td style={S.td}>{o.tarih||"—"}</td>
-                    <td style={S.td}><span style={{...S.badge,...(o.durum==="odendi"?{background:"#D1FAE5",color:"#065F46"}:{background:"#FEF3C7",color:"#92400E"})}}>{DURUM_LABEL[o.durum]}</span></td>
-                  </tr>
-                ))}</tbody>
-              </table>
-            }
+            <div style={S.cardTitle}>🧾 Borç / Eksik Ödemeler</div>
+            {borclar.map(b=>(
+              <div key={b.id} style={{ padding:"10px 0",borderBottom:"1px solid #F3F4F6",display:"flex",justifyContent:"space-between",fontSize:13 }}>
+                <div><b>{b.donemAd}</b><div style={{ fontSize:11,color:"#9CA3AF" }}>{b.not||"—"}</div></div>
+                <b style={{ color:kalan(b)?"#D85A30":"#1D9E75" }}>{kalan(b)?`₺${fmt(kalan(b))} kalan`:"Kapandı"}</b>
+              </div>
+            ))}
           </div>
         )}
-
-        {tab==="duyuru" && (
-          <div style={S.card}>
-            <div style={S.cardTitle}>📢 Duyurular</div>
-            {duyurular.length===0?<p style={{color:"#9CA3AF",padding:"20px 0"}}>Duyuru yok</p>:
-              duyurular.map(du=>(
-                <div key={du.id} style={{padding:"12px 0",borderBottom:"1px solid #F3F4F6"}}>
-                  <div style={{fontWeight:600,color:"#111"}}>{du.baslik}</div>
-                  <div style={{fontSize:12,color:"#6B7280",marginTop:4}}>{du.icerik}</div>
-                  <div style={{fontSize:10,color:"#9CA3AF",marginTop:4}}>{du.tarih}</div>
-                </div>
-              ))
-            }
-          </div>
-        )}
+        <div style={S.card}>
+          <div style={S.cardTitle}>📋 Ödeme Geçmişi</div>
+          {odemeler.length===0 ? <Bos t="Kayıt yok"/> : (
+            <table style={S.table}><thead><tr><th style={S.th}>Dönem</th><th style={S.th}>Tutar</th><th style={S.th}>Tarih</th></tr></thead>
+              <tbody>{odemeler.map(o=>(<tr key={o.id}><td style={S.td}>{o.donemAd||o.donem}</td><td style={S.td}>₺{fmt(o.tutar)}</td><td style={S.td}>{o.tarih||"—"}</td></tr>))}</tbody></table>
+          )}
+        </div>
       </div>
     </div>
   );
