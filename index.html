@@ -10,16 +10,32 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'DM Sans', system-ui, sans-serif; }
-    /* Masaüstü: üst menü görünür, alt menü gizli */
+    :root { --brand:#1D9E75; --line:#E5E7EB; --muted:#6B7280; }
+    html { -webkit-text-size-adjust: 100%; }
+    body { font-family: 'DM Sans', system-ui, sans-serif; background:#F6F7F9; color:#111827; -webkit-font-smoothing:antialiased; -webkit-tap-highlight-color:transparent; }
+    button, input, select, textarea { font-family: inherit; }
+    button { transition: transform .1s, box-shadow .15s, background .15s; }
+    button:active { transform: scale(.97); }
+    button:hover { filter: brightness(.97); }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: var(--brand) !important; box-shadow: 0 0 0 3px rgba(29,158,117,.18); }
+    button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+    /* Ay / yıl butonları */
+    .chips { display:flex; gap:8px; overflow-x:auto; padding:2px 2px 12px; scrollbar-width:none; }
+    .chips::-webkit-scrollbar { display:none; }
+    .chip { flex:none; min-height:38px; padding:8px 16px; border-radius:999px; border:1px solid var(--line); background:#fff; color:var(--muted); font-size:13px; font-weight:600; cursor:pointer; }
+    .chip.on { background:var(--brand); border-color:var(--brand); color:#fff; box-shadow:0 2px 8px rgba(29,158,117,.28); }
     .mobile-nav { display: none !important; }
-    /* Mobil: alt menü görünür, üst menü gizli */
     @media (max-width: 640px) {
       .mobile-nav { display: flex !important; }
       .desktop-nav { display: none !important; }
       .metric-grid { grid-template-columns: repeat(2, 1fr) !important; }
       .two-col { grid-template-columns: 1fr !important; }
     }
+    @media print {
+      .no-print, .desktop-nav, .mobile-nav { display: none !important; }
+      body { background:#fff; }
+    }
+    @media (prefers-reduced-motion: reduce) { * { transition:none !important; animation:none !important; } }
   </style>
 </head>
 <body>

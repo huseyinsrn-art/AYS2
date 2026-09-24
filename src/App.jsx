@@ -238,6 +238,7 @@ function AdminPanel({ daireler, ayarlar, aidatTutar }) {
     {id:"aidat",  icon:"💳",label:"Aidat"},
     {id:"gelirler",icon:"💰",label:"Gelirler"},
     {id:"giderler",icon:"📉",label:"Giderler"},
+    {id:"rapor",  icon:"📑",label:"Rapor"},
     {id:"duyuru", icon:"📢",label:"Duyuru"},
     {id:"mesaj",  icon:"💬",label:"Mesaj"},
     {id:"ayarlar",icon:"⚙️", label:"Ayarlar"},
@@ -257,6 +258,7 @@ function AdminPanel({ daireler, ayarlar, aidatTutar }) {
         {tab==="aidat"     && <TabAidat      daireler={daireler} aidatTutar={aidatTutar}/>}
         {tab==="gelirler"  && <TabGelirler   />}
         {tab==="giderler"  && <TabGiderler   />}
+        {tab==="rapor"     && <TabRapor      />}
         {tab==="duyuru"    && <TabDuyuru     />}
         {tab==="mesaj"     && <TabMesaj      daireler={daireler}/>}
         {tab==="ayarlar"   && <TabAyarlar    ayarlar={ayarlar} daireler={daireler}/>}
@@ -572,16 +574,19 @@ function ayFiltrele(kayitlar, secili) {
   return { keys, gecerli, gorunen };
 }
 
-function AyFiltre({ keys, secili, onChange }) {
+function Chips({ items, secili, onChange }) {
   return (
-    <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap" }}>
-      <span style={{ fontSize:12,fontWeight:600,color:"#6B7280" }}>Dönem:</span>
-      <select style={{ ...S.select,width:"auto",minWidth:170 }} value={secili} onChange={e=>onChange(e.target.value)}>
-        <option value="tumu">Tüm aylar</option>
-        {keys.map(k => <option key={k||"yok"} value={k}>{ayAdi(k)}</option>)}
-      </select>
+    <div className="chips no-print">
+      {items.map(i => (
+        <button key={String(i.v)} className={"chip" + (secili === i.v ? " on" : "")} onClick={()=>onChange(i.v)}>{i.l}</button>
+      ))}
     </div>
   );
+}
+
+function AyFiltre({ keys, secili, onChange }) {
+  return <Chips secili={secili} onChange={onChange}
+    items={[{ v:"tumu", l:"Tümü" }, ...keys.map(k => ({ v:k, l:ayAdi(k) }))]} />;
 }
 
 // Kayıtları ay ay gruplar; her ay için toplam ve kategori/kaynak kırılımı gösterir
@@ -760,6 +765,118 @@ function TabGiderler() {
       <AyFiltre keys={ayKeys} secili={ayGecerli} onChange={setAy}/>
       <AyListe kayitlar={gorunen} alan="kategori" renk="#D85A30" isaret="-" bos="Gider yok"
         etiket={g=>g.kategori} silinebilir={()=>true} onSil={sil}/>
+    </div>
+  );
+}
+
+// ── TAB: RAPOR ────────────────────────────────────────────────────────────
+function DagilimKart({ baslik, liste, toplam, renk }) {
+  return (
+    <div style={S.card}>
+      <div style={S.cardTitle}>{baslik}</div>
+      {liste.length === 0 ? <p style={{ color:"#9CA3AF",padding:"16px 0",fontSize:13 }}>Veri yok</p> :
+        liste.map(([ad, t]) => {
+          const y = toplam ? Math.round(t / toplam * 100) : 0;
+          return (
+            <div key={ad} style={{ marginTop:12 }}>
+              <div style={{ display:"flex",justifyContent:"space-between",fontSize:13 }}>
+                <span style={{ fontWeight:600 }}>{ad}</span>
+                <span style={{ fontWeight:700,color:renk }}>₺{fmt(t)} <span style={{ color:"#9CA3AF",fontWeight:500 }}>%{y}</span></span>
+              </div>
+              <div style={{ ...S.barTrack,marginTop:5 }}><div style={{ ...S.barFill,width:`${y}%`,background:renk }}/></div>
+            </div>
+          );
+        })}
+    </div>
+  );
+}
+
+function TabRapor() {
+  const [gelirler,setGelirler] = useState([]);
+  const [giderler,setGiderler] = useState([]);
+  const [yil,setYil] = useState(CUR_YEAR);
+  const [ay,setAy]   = useState("tumu");
+
+  useEffect(()=>{
+    const a=onSnapshot(query(collection(db,"gelirler"),orderBy("tarih","desc")),sn=>setGelirler(sn.docs.map(x=>({id:x.id,...x.data()}))));
+    const b=onSnapshot(query(collection(db,"giderler"),orderBy("tarih","desc")),sn=>setGiderler(sn.docs.map(x=>({id:x.id,...x.data()}))));
+    return()=>{a();b();};
+  },[]);
+
+  const sum = l => l.reduce((t,k)=>t+(k.tutar||0),0);
+  const yillar = [...new Set([CUR_YEAR,...[...gelirler,...giderler].map(k=>Number(ayOf(k.tarih).slice(0,4))).filter(Boolean)])].sort((a,b)=>b-a);
+  const mKey = m => `${yil}-${String(m+1).padStart(2,"0")}`;
+  const secili = k => ayOf(k.tarih).startsWith(`${yil}-`) && (ay==="tumu" || ayOf(k.tarih)===mKey(ay));
+  const gel = gelirler.filter(secili), gid = giderler.filter(secili);
+  const tG = sum(gel), tD = sum(gid), net = tG - tD;
+  const aylik = MONTHS_SHORT.map((ad,m)=>{
+    const g = sum(gelirler.filter(k=>ayOf(k.tarih)===mKey(m))), d = sum(giderler.filter(k=>ayOf(k.tarih)===mKey(m)));
+    return { m, ad, Gelir:g, Gider:d, Net:g-d };
+  });
+  const dagilim = (l,alan) => {
+    const o={}; l.forEach(k=>{const e=k[alan]||"Diğer"; o[e]=(o[e]||0)+(k.tutar||0);});
+    return Object.entries(o).sort((a,b)=>b[1]-a[1]);
+  };
+  const donem = ay==="tumu" ? `${yil} · Tüm yıl` : `${MONTH_NAMES[ay]} ${yil}`;
+  const dolu = aylik.filter(r=>r.Gelir||r.Gider);
+
+  return (
+    <div>
+      <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap" }}>
+        <div style={{ fontSize:18,fontWeight:700 }}>📑 Gelir–Gider Raporu</div>
+        <button className="no-print" style={S.addBtn} onClick={()=>window.print()}>🖨️ Yazdır / PDF</button>
+      </div>
+      <Chips secili={yil} onChange={v=>{setYil(v);setAy("tumu");}} items={yillar.map(y=>({v:y,l:String(y)}))}/>
+      <Chips secili={ay} onChange={setAy} items={[{v:"tumu",l:"Tüm yıl"},...MONTHS_SHORT.map((l,m)=>({v:m,l}))]}/>
+
+      <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12,marginBottom:16 }}>
+        <MetricCard label="Toplam Gelir" val={`₺${fmt(tG)}`} color="#1D9E75" sub={donem}/>
+        <MetricCard label="Toplam Gider" val={`₺${fmt(tD)}`} color="#D85A30" sub={donem}/>
+        <MetricCard label="Net Bakiye" val={`${net<0?"-":""}₺${fmt(Math.abs(net))}`} color={net>=0?"#1D9E75":"#D85A30"} sub={net>=0?"Fazla":"Açık"}/>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.cardTitle}>📊 {yil} Aylık Karşılaştırma</div>
+        <ResponsiveContainer width="100%" height={240}>
+          <BarChart data={aylik}><CartesianGrid strokeDasharray="3 3" stroke="#F3F4F6" vertical={false}/>
+            <XAxis dataKey="ad" fontSize={11} tickLine={false}/><YAxis fontSize={11} tickLine={false} axisLine={false}/>
+            <Tooltip formatter={v=>`₺${fmt(v)}`}/><Legend/>
+            <Bar dataKey="Gelir" fill="#1D9E75" radius={[6,6,0,0]}/><Bar dataKey="Gider" fill="#D85A30" radius={[6,6,0,0]}/>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.cardTitle}>🗓️ Aylık Döküm</div>
+        {dolu.length===0 ? <p style={{ color:"#9CA3AF",padding:"16px 0",fontSize:13 }}>{yil} için kayıt yok</p> : (
+          <div style={{ overflowX:"auto" }}>
+            <table style={S.table}>
+              <thead><tr><th style={S.th}>Ay</th><th style={{...S.th,textAlign:"right"}}>Gelir</th><th style={{...S.th,textAlign:"right"}}>Gider</th><th style={{...S.th,textAlign:"right"}}>Net</th></tr></thead>
+              <tbody>
+                {dolu.map(r=>(
+                  <tr key={r.m} onClick={()=>setAy(r.m)} style={{ cursor:"pointer",background:ay===r.m?"#ECFDF5":"transparent" }}>
+                    <td style={S.td}><b>{MONTH_NAMES[r.m]}</b></td>
+                    <td style={{...S.td,textAlign:"right",color:"#1D9E75"}}>₺{fmt(r.Gelir)}</td>
+                    <td style={{...S.td,textAlign:"right",color:"#D85A30"}}>₺{fmt(r.Gider)}</td>
+                    <td style={{...S.td,textAlign:"right",fontWeight:700,color:r.Net>=0?"#1D9E75":"#D85A30"}}>{r.Net<0?"-":""}₺{fmt(Math.abs(r.Net))}</td>
+                  </tr>
+                ))}
+                <tr>
+                  <td style={{...S.td,fontWeight:700,borderBottom:"none"}}>Toplam</td>
+                  <td style={{...S.td,textAlign:"right",fontWeight:700,borderBottom:"none"}}>₺{fmt(sum(dolu.map(r=>({tutar:r.Gelir}))))}</td>
+                  <td style={{...S.td,textAlign:"right",fontWeight:700,borderBottom:"none"}}>₺{fmt(sum(dolu.map(r=>({tutar:r.Gider}))))}</td>
+                  <td style={{...S.td,textAlign:"right",fontWeight:700,borderBottom:"none"}}>₺{fmt(sum(dolu.map(r=>({tutar:r.Net}))))}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="two-col" style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12 }}>
+        <DagilimKart baslik={`💰 Gelir Kaynakları · ${donem}`} liste={dagilim(gel,"kaynak")} toplam={tG} renk="#1D9E75"/>
+        <DagilimKart baslik={`📉 Gider Kategorileri · ${donem}`} liste={dagilim(gid,"kategori")} toplam={tD} renk="#D85A30"/>
+      </div>
     </div>
   );
 }
@@ -1088,7 +1205,7 @@ async function logAction(detay, tur) {
 
 function Topbar({title,sub,onCikis}) {
   return (
-    <div style={S.topbar}>
+    <div className="no-print" style={S.topbar}>
       <div style={{display:"flex",alignItems:"center",gap:10}}>
         <div style={S.logoBox}>🏢</div>
         <div><div style={S.topTitle}>{title}</div><div style={S.topSub}>{sub}</div></div>
@@ -1154,3 +1271,28 @@ const S={
   loginHint:{marginTop:20,padding:12,background:"#F9FAFB",borderRadius:8,fontSize:11,color:"#9CA3AF",lineHeight:"1.6"},
   hataBox:{background:"#FEE2E2",color:"#991B1B",borderRadius:8,padding:"8px 12px",fontSize:12,marginBottom:10},
 };
+
+// ── Modern tasarım katmanı ────────────────────────────────────────────────
+const GOLGE = "0 1px 2px rgba(16,24,40,.04), 0 4px 16px rgba(16,24,40,.05)";
+const TEMA = {
+  app:{ background:"#F6F7F9" },
+  topbar:{ background:"rgba(255,255,255,.85)", backdropFilter:"saturate(180%) blur(12px)", borderBottom:"1px solid #EEF0F3" },
+  desktopNav:{ background:"#fff", borderBottom:"1px solid #EEF0F3", padding:"10px 20px", gap:6 },
+  navBtn:{ borderRadius:999, padding:"9px 16px", transition:"all .15s" },
+  navActive:{ background:"#E8F7F1", color:"#0B6B4D" },
+  mobileNav:{ background:"rgba(255,255,255,.92)", backdropFilter:"blur(12px)", borderTop:"1px solid #EEF0F3", paddingBottom:"env(safe-area-inset-bottom)" },
+  mobileNavBtn:{ minHeight:52, gap:2 },
+  card:{ border:"1px solid #EEF0F3", borderRadius:18, padding:"18px 20px", boxShadow:GOLGE },
+  heroCard:{ border:"1px solid #EEF0F3", borderRadius:18, boxShadow:GOLGE },
+  metricCard:{ border:"1px solid #EEF0F3", borderRadius:16, padding:"16px 18px", boxShadow:GOLGE },
+  metricVal:{ fontSize:24, letterSpacing:"-0.02em", fontVariantNumeric:"tabular-nums" },
+  addBtn:{ background:"linear-gradient(135deg,#1D9E75,#15805F)", borderRadius:10, padding:"11px 18px", boxShadow:"0 2px 8px rgba(29,158,117,.28)", transition:"transform .1s" },
+  filterBtn:{ borderRadius:999, padding:"8px 14px", background:"#fff" },
+  smallBtn:{ borderRadius:8, padding:"7px 12px" },
+  input:{ borderRadius:10, padding:"11px 12px", border:"1px solid #E1E4E8" },
+  select:{ borderRadius:10, padding:"11px 12px", border:"1px solid #E1E4E8" },
+  td:{ padding:"12px 0", fontVariantNumeric:"tabular-nums" },
+  loginCard:{ borderRadius:22, boxShadow:"0 8px 40px rgba(16,24,40,.08)", border:"1px solid #EEF0F3" },
+  loginWrap:{ background:"linear-gradient(160deg,#ECFDF5 0%,#F6F7F9 55%)", padding:16 },
+};
+Object.keys(TEMA).forEach(k => { S[k] = { ...S[k], ...TEMA[k] }; });
