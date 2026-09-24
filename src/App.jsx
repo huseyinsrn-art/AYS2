@@ -544,19 +544,21 @@ function Kolon({ baslik, koleksiyon, alan, secenekler, liste, renk, isaret, ay }
 
 function TabGelirGider() {
   const gelirler = useCol("gelirler","tarih"), giderler = useCol("giderler","tarih");
-  const cur = curKey();
-  const [ay,setAy] = useState(cur);
-  const keys = [...new Set([cur, ...gelirler.map(gelirAy), ...giderler.map(k=>ayOf(k.tarih))])].filter(Boolean).sort().reverse();
-  const sec = ay==="tumu" || keys.includes(ay) ? ay : "tumu";
-  const f = (l,fn) => sec==="tumu" ? l : l.filter(k=>fn(k)===sec);
-  const gel = f(gelirler,gelirAy), gid = f(giderler,k=>ayOf(k.tarih)), net = topla(gel) - topla(gid);
+  const [yil,setYil] = useState(CUR_YEAR);
+  const [ay,setAy] = useState(CUR_MONTH);
+  const mKey = m => `${yil}-${String(m+1).padStart(2,"0")}`;
+  const yillar = [...new Set([String(CUR_YEAR), ...gelirler.map(k=>gelirAy(k).slice(0,4)), ...giderler.map(k=>ayOf(k.tarih).slice(0,4))])].filter(Boolean).sort().reverse().map(Number);
+  const dolu = new Set([...gelirler.map(gelirAy), ...giderler.map(k=>ayOf(k.tarih))]);
+  const sec = ay==="tumu" ? "tumu" : mKey(ay);
+  const uyar = key => sec==="tumu" ? key.startsWith(`${yil}-`) : key===sec;
+  const gel = gelirler.filter(k=>uyar(gelirAy(k))), gid = giderler.filter(k=>uyar(ayOf(k.tarih)));
+  const net = topla(gel) - topla(gid);
   return (
     <div>
-      <div style={{ display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginBottom:14 }}>
-        <select style={{ ...S.select,width:"auto",minWidth:190,fontWeight:700 }} value={sec} onChange={e=>setAy(e.target.value)}>
-          <option value="tumu">Tüm aylar</option>
-          {keys.map(k=><option key={k} value={k}>{ayAdi(k)}</option>)}
-        </select>
+      <Chips secili={yil} onChange={v=>{ setYil(v); setAy("tumu"); }} items={yillar.map(y=>({v:y,l:String(y)}))}/>
+      <Chips secili={ay} onChange={setAy} items={[{v:"tumu",l:"Tüm yıl"}, ...MONTHS_SHORT.map((l,m)=>({v:m,l:dolu.has(mKey(m))?`${l} •`:l}))]}/>
+      <div style={{ display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginBottom:12 }}>
+        <b style={{ fontSize:16 }}>{sec==="tumu" ? `${yil} yılı` : ayAdi(sec)}</b>
         <span style={{ ...S.badge,background:net>=0?"#D1FAE5":"#FEE2E2",color:net>=0?"#065F46":"#991B1B",fontSize:13 }}>Net: {net<0?"-":""}₺{fmt(Math.abs(net))}</span>
       </div>
       <div className="two-col" style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,alignItems:"start" }}>
@@ -675,28 +677,115 @@ function TabBorclar({ daireler }) {
   );
 }
 
-// ── RAPOR (PDF çıktısı) ───────────────────────────────────────────────────
+// ── RAPOR (görsel + PDF çıktısı) ──────────────────────────────────────────
+const PALET = ["#1D9E75","#0891B2","#6366F1","#BA7517","#D85A30","#8B5CF6","#EC4899","#64748B"];
+const kisa = n => n >= 1000 ? `${Math.round(n/100)/10}b`.replace(".",",") : String(Math.round(n));
+
+function AylikGrafik({ aylik, ay, onSec }) {
+  const max = Math.max(1, ...aylik.flatMap(r=>[r.g,r.d]));
+  const H = 150, T = 12, gw = 50, X0 = 34, W = X0 + gw*12;
+  const y = v => T + H - v/max*H;
+  return (
+    <svg viewBox={`0 0 ${W} ${T+H+24}`} style={{ width:"100%",height:"auto",display:"block" }} role="img" aria-label="Aylık gelir gider grafiği">
+      {[0,.5,1].map(f=>(
+        <g key={f}>
+          <line x1={X0} x2={W} y1={y(max*f)} y2={y(max*f)} stroke="#EEF0F3" strokeDasharray={f?"3 3":"0"}/>
+          <text x={X0-6} y={y(max*f)+3} textAnchor="end" fontSize="9" fill="#9CA3AF">{kisa(max*f)}</text>
+        </g>
+      ))}
+      {aylik.map(r=>{
+        const x = X0 + r.m*gw;
+        return (
+          <g key={r.m} onClick={()=>onSec(r.m)} style={{ cursor:"pointer" }}>
+            {ay===r.m && <rect x={x+2} y={T-6} width={gw-4} height={H+30} rx="8" fill="#ECFDF5"/>}
+            <rect x={x+gw/2-14} y={y(r.g)} width="13" height={r.g/max*H} rx="3" fill="#1D9E75"/>
+            <rect x={x+gw/2+1}  y={y(r.d)} width="13" height={r.d/max*H} rx="3" fill="#D85A30"/>
+            <text x={x+gw/2} y={T+H+15} textAnchor="middle" fontSize="10" fontWeight={ay===r.m?700:500} fill={ay===r.m?"#065F46":"#6B7280"}>{MONTHS_SHORT[r.m]}</text>
+            <rect x={x} y={T-6} width={gw} height={H+30} fill="transparent"/>
+            <title>{`${MONTH_NAMES[r.m]}: gelir ₺${fmt(r.g)} · gider ₺${fmt(r.d)}`}</title>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function Donut({ baslik, liste, toplam }) {
+  const R = 42, C = 2*Math.PI*R;
+  let off = 0;
+  return (
+    <div style={S.card}>
+      <div style={S.cardTitle}>{baslik}</div>
+      {liste.length===0 ? <Bos t="Veri yok"/> : (
+        <div style={{ display:"flex",gap:14,alignItems:"center",flexWrap:"wrap",marginTop:8 }}>
+          <svg viewBox="0 0 120 120" width="128" height="128" style={{ flex:"none" }}>
+            <g transform="rotate(-90 60 60)">
+              <circle cx="60" cy="60" r={R} fill="none" stroke="#F3F4F6" strokeWidth="16"/>
+              {liste.map(([ad,t],i)=>{
+                const len = toplam ? t/toplam*C : 0, el = (
+                  <circle key={ad} cx="60" cy="60" r={R} fill="none" stroke={PALET[i%PALET.length]} strokeWidth="16"
+                    strokeDasharray={`${len} ${C-len}`} strokeDashoffset={-off}/>);
+                off += len; return el;
+              })}
+            </g>
+            <text x="60" y="57" textAnchor="middle" fontSize="8" fill="#9CA3AF">Toplam</text>
+            <text x="60" y="71" textAnchor="middle" fontSize="12" fontWeight="700" fill="#111827">₺{fmt(toplam)}</text>
+          </svg>
+          <div style={{ flex:1,minWidth:150 }}>
+            {liste.map(([ad,t],i)=>(
+              <div key={ad} style={{ display:"flex",alignItems:"center",gap:8,padding:"5px 0",fontSize:12 }}>
+                <span style={{ width:10,height:10,borderRadius:3,background:PALET[i%PALET.length],flex:"none" }}/>
+                <span style={{ flex:1,textTransform:"capitalize" }}>{ad}</span>
+                <b>₺{fmt(t)}</b><span style={{ color:"#9CA3AF",width:34,textAlign:"right" }}>%{Math.round(t/toplam*100)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TabRapor({ daireler }) {
   const odemeler = useCol("odemeler"), gelirler = useCol("gelirler","tarih"), giderler = useCol("giderler","tarih"), borclar = useCol("borclar");
   const [yil,setYil] = useState(CUR_YEAR);
   const [ay,setAy] = useState("tumu");
+  const cur = curKey(), startKey = gecmisAylar()[0].key;
   const mKey = m => `${yil}-${String(m+1).padStart(2,"0")}`;
   const bas = ay==="tumu" ? mKey(0) : mKey(ay), son = ay==="tumu" ? mKey(11) : mKey(ay);
   const inP = key => key >= bas && key <= son;
-  const yillar = [...new Set([CUR_YEAR, ...[...gelirler.map(gelirAy),...giderler.map(k=>ayOf(k.tarih))].map(k=>Number(k.slice(0,4))).filter(Boolean)])].sort((a,b)=>b-a);
+  const yillar = [...new Set([String(CUR_YEAR), ...gelirler.map(gelirAy).map(k=>k.slice(0,4)), ...giderler.map(k=>ayOf(k.tarih).slice(0,4))])].filter(Boolean).sort().reverse().map(Number);
   const gel = gelirler.filter(k=>inP(gelirAy(k))), gid = giderler.filter(k=>inP(ayOf(k.tarih)));
   const tG = topla(gel), tD = topla(gid);
   const alacak = borclar.filter(b=>inP(b.donem)).reduce((a,b)=>a+acikTutar(b),0);
   const net = tG - tD - alacak;
   const donem = ay==="tumu" ? `${yil} yılı` : `${MONTH_NAMES[ay]} ${yil}`;
   const aylik = MONTH_NAMES.map((ad,m)=>({ m, ad,
-    g:topla(gelirler.filter(k=>gelirAy(k)===mKey(m))), d:topla(giderler.filter(k=>ayOf(k.tarih)===mKey(m))) })).filter(r=>r.g||r.d);
+    g:topla(gelirler.filter(k=>gelirAy(k)===mKey(m))), d:topla(giderler.filter(k=>ayOf(k.tarih)===mKey(m))) }));
+  const dagilim = (l,alan) => {
+    const o = {}; l.forEach(k=>{ const e = k[alan]||"Diğer"; o[e] = (o[e]||0)+(k.tutar||0); });
+    return Object.entries(o).sort((a,b)=>b[1]-a[1]);
+  };
+  const odenenSet = new Set(odemeler.filter(o=>o.durum==="odendi").map(o=>`${o.daire}|${o.donem}`));
+  const acikSet = new Set(borclar.filter(b=>acikTutar(b)>0).map(b=>`${b.daire}|${b.donem}`));
+  // Tahsilat oranı: dönemdeki (başlangıç–bugün arası) beklenen aidat sayısına göre
+  const donemAylari = Array.from({length:12},(_,m)=>mKey(m)).filter(k=>inP(k) && k>=startKey && k<=cur);
+  const beklenenSayi = donemAylari.length * daireler.length;
+  const odenenSayi = daireler.reduce((a,d)=>a+donemAylari.filter(k=>odenenSet.has(`${d.id}|${k}`)).length,0);
+  const oran = beklenenSayi ? Math.round(odenenSayi/beklenenSayi*100) : 0;
   const daireRows = daireler.map(d=>{
     const aidatOd = odemeler.filter(o=>o.daire===d.id && o.durum==="odendi" && inP(o.donem));
     const acik = borclar.filter(b=>b.daire===d.id && inP(b.donem)).reduce((a,b)=>a+acikTutar(b),0);
     return { d, ay:aidatOd.length, toplam:topla(aidatOd)-acik, acik };
   });
+  const maxD = Math.max(1, ...daireRows.map(r=>r.toplam));
   const th = { ...S.th,textAlign:"right" }, tdr = { ...S.td,textAlign:"right" };
+  const hucre = (d,key) => {
+    if (key < startKey) return { bg:"#F3F4F6", t:"Kayıt öncesi" };
+    if (odenenSet.has(`${d.id}|${key}`)) return { bg:"#1D9E75", t:"Ödendi" };
+    if (key > cur) return { bg:"#F3F4F6", t:"Henüz gelmedi" };
+    return key === cur ? { bg:"#F5B942", t:"Bekliyor" } : { bg:"#E5484D", t:"Gecikmiş" };
+  };
   const Liste = ({ baslik, liste, alan, renk }) => (
     <div style={S.card}>
       <div style={S.cardTitle}>{baslik}</div>
@@ -719,31 +808,66 @@ function TabRapor({ daireler }) {
       </div>
       <Chips secili={yil} onChange={v=>{ setYil(v); setAy("tumu"); }} items={yillar.map(y=>({v:y,l:String(y)}))}/>
       <Chips secili={ay} onChange={setAy} items={[{v:"tumu",l:"Tüm yıl"}, ...MONTHS_SHORT.map((l,m)=>({v:m,l}))]}/>
-      <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:12,marginBottom:16 }}>
+
+      <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(135px,1fr))",gap:12,marginBottom:16 }}>
         <MetricCard label="Toplam Gelir" val={`₺${fmt(tG)}`} color="#1D9E75"/>
         <MetricCard label="Toplam Gider" val={`₺${fmt(tD)}`} color="#D85A30"/>
         <MetricCard label="Açık Alacak" val={`₺${fmt(alacak)}`} color="#BA7517"/>
         <MetricCard label="Net Kasa" val={`${net<0?"-":""}₺${fmt(Math.abs(net))}`} color={net>=0?"#1D9E75":"#D85A30"}/>
+        <MetricCard label="Tahsilat Oranı" val={`%${oran}`} color="#6366F1" sub={`${odenenSayi}/${beklenenSayi} aidat`}/>
       </div>
+
       <div style={S.card}>
-        <div style={S.cardTitle}>🗓️ {yil} Aylık Özet</div>
-        {aylik.length===0 ? <Bos t="Kayıt yok"/> : (
-          <table style={S.table}><thead><tr><th style={S.th}>Ay</th><th style={th}>Gelir</th><th style={th}>Gider</th><th style={th}>Net</th></tr></thead>
-            <tbody>{aylik.map(r=>(<tr key={r.m} onClick={()=>setAy(r.m)} style={{ cursor:"pointer",background:ay===r.m?"#ECFDF5":"transparent" }}>
-              <td style={S.td}><b>{r.ad}</b></td><td style={{ ...tdr,color:"#1D9E75" }}>₺{fmt(r.g)}</td><td style={{ ...tdr,color:"#D85A30" }}>₺{fmt(r.d)}</td>
-              <td style={{ ...tdr,fontWeight:700 }}>{r.g-r.d<0?"-":""}₺{fmt(Math.abs(r.g-r.d))}</td></tr>))}</tbody></table>
-        )}
+        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6 }}>
+          <div style={S.cardTitle}>📊 {yil} Aylık Gelir – Gider</div>
+          <div style={{ display:"flex",gap:12,fontSize:11,color:"#6B7280" }}>
+            <span><span style={{ color:"#1D9E75" }}>■</span> Gelir</span><span><span style={{ color:"#D85A30" }}>■</span> Gider</span>
+          </div>
+        </div>
+        <AylikGrafik aylik={aylik} ay={ay} onSec={m=>setAy(ay===m?"tumu":m)}/>
+        <div className="no-print" style={{ fontSize:11,color:"#9CA3AF",marginTop:4 }}>Bir aya dokunarak o ayı seçebilirsiniz.</div>
       </div>
+
+      <div className="two-col" style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12 }}>
+        <Donut baslik={`💰 Gelir Kaynakları · ${donem}`} liste={dagilim(gel,"kaynak")} toplam={tG}/>
+        <Donut baslik={`📉 Gider Kategorileri · ${donem}`} liste={dagilim(gid,"kategori")} toplam={tD}/>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.cardTitle}>🗓️ {yil} Ödeme Takvimi</div>
+        <div style={{ display:"grid",gridTemplateColumns:"minmax(54px,auto) repeat(12,1fr)",gap:3,marginTop:10,alignItems:"center" }}>
+          <span/>{MONTHS_SHORT.map((l,m)=>(<span key={l} style={{ fontSize:9,textAlign:"center",color:ay===m?"#065F46":"#9CA3AF",fontWeight:ay===m?700:500 }}>{l}</span>))}
+          {daireler.map(d=>(
+            <div key={d.id} style={{ display:"contents" }}>
+              <span style={{ fontSize:11,fontWeight:600,paddingRight:6 }}>{d.id}</span>
+              {Array.from({length:12},(_,m)=>{ const h = hucre(d,mKey(m)), acikVar = acikSet.has(`${d.id}|${mKey(m)}`); return (
+                <span key={m} title={`${d.id} · ${MONTH_NAMES[m]}: ${h.t}${acikVar?" · açık alacak var":""}`}
+                  style={{ background:h.bg,borderRadius:5,height:20,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:"#fff",outline:ay===m?"2px solid #A7F3D0":"none" }}>{acikVar?"!":""}</span>); })}
+            </div>
+          ))}
+        </div>
+        <div style={{ display:"flex",gap:12,flexWrap:"wrap",fontSize:11,color:"#6B7280",marginTop:12 }}>
+          {[["#1D9E75","Ödendi"],["#F5B942","Bekliyor"],["#E5484D","Gecikmiş"],["#F3F4F6","Kayıt dışı / gelecek"]].map(([c,t])=>(
+            <span key={t}><span style={{ display:"inline-block",width:10,height:10,borderRadius:3,background:c,marginRight:5,border:"1px solid #E5E7EB" }}/>{t}</span>))}
+          <span><b style={{ color:"#D85A30" }}>!</b> açık alacak</span>
+        </div>
+      </div>
+
       <div style={S.card}>
         <div style={S.cardTitle}>🏠 Daire Bazlı Ödemeler · {donem}</div>
-        <table style={S.table}><thead><tr><th style={S.th}>Daire</th><th style={S.th}>Sakin</th><th style={th}>Aidat (ay)</th><th style={th}>Toplam Ödenen</th><th style={th}>Açık Borç</th></tr></thead>
-          <tbody>{daireRows.map(r=>(<tr key={r.d.id}>
-            <td style={S.td}><b>{r.d.id}</b></td><td style={S.td}>{sakinlar(r.d,bas,son)}</td><td style={tdr}>{r.ay}</td>
-            <td style={{ ...tdr,fontWeight:700,color:"#1D9E75" }}>₺{fmt(r.toplam)}</td><td style={{ ...tdr,color:r.acik?"#D85A30":"#9CA3AF" }}>{r.acik?`₺${fmt(r.acik)}`:"—"}</td></tr>))}
-            <tr><td style={{ ...S.td,fontWeight:700,borderBottom:"none" }} colSpan={3}>Toplam</td>
-              <td style={{ ...tdr,fontWeight:700,borderBottom:"none" }}>₺{fmt(daireRows.reduce((a,r)=>a+r.toplam,0))}</td>
-              <td style={{ ...tdr,fontWeight:700,borderBottom:"none" }}>₺{fmt(daireRows.reduce((a,r)=>a+r.acik,0))}</td></tr></tbody></table>
+        <div style={{ overflowX:"auto" }}>
+          <table style={S.table}><thead><tr><th style={S.th}>Daire</th><th style={S.th}>Sakin</th><th style={th}>Aidat (ay)</th><th style={{ ...th,minWidth:120 }}>Toplam Ödenen</th><th style={th}>Açık Borç</th></tr></thead>
+            <tbody>{daireRows.map(r=>(<tr key={r.d.id}>
+              <td style={S.td}><b>{r.d.id}</b></td><td style={S.td}>{sakinlar(r.d,bas,son)}</td><td style={tdr}>{r.ay}</td>
+              <td style={tdr}><b style={{ color:"#1D9E75" }}>₺{fmt(r.toplam)}</b>
+                <div style={{ height:5,background:"#F3F4F6",borderRadius:9,marginTop:4 }}><div style={{ height:5,borderRadius:9,background:"#1D9E75",width:`${Math.max(0,r.toplam)/maxD*100}%` }}/></div></td>
+              <td style={{ ...tdr,color:r.acik?"#D85A30":"#9CA3AF" }}>{r.acik?`₺${fmt(r.acik)}`:"—"}</td></tr>))}
+              <tr><td style={{ ...S.td,fontWeight:700,borderBottom:"none" }} colSpan={3}>Toplam</td>
+                <td style={{ ...tdr,fontWeight:700,borderBottom:"none" }}>₺{fmt(daireRows.reduce((a,r)=>a+r.toplam,0))}</td>
+                <td style={{ ...tdr,fontWeight:700,borderBottom:"none" }}>₺{fmt(daireRows.reduce((a,r)=>a+r.acik,0))}</td></tr></tbody></table>
+        </div>
       </div>
+
       <Liste baslik={`💰 Gelir Kalemleri · ${donem}`} liste={gel} alan="kaynak" renk="#1D9E75"/>
       <Liste baslik={`📉 Gider Kalemleri · ${donem}`} liste={gid} alan="kategori" renk="#D85A30"/>
     </div>
