@@ -1,0 +1,54 @@
+rules_version = '2';
+
+// Mert Apartmanı No 105 — Firestore güvenlik kuralları
+// Deploy: npx firebase deploy --only firestore:rules
+// Joker (/{document=**}) kural YOK: burada tanımlanmayan her koleksiyon kapalıdır.
+//
+// gstack-shortcut: yönetici e-postayla tanımlı (minimal yaklaşım A). Yönetici değişirse
+// bu dosyadaki e-posta güncellenip yeniden deploy edilmeli. İkinci yönetici gerekirse
+// ya da uygulama başka apartmana sunulursa rol belgesine (kullanicilar/{uid}) geçilmeli.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isAdmin()  { return signedIn() && request.auth.token.email == 'mertaparmani@gmail.com'; }
+    function isSakin()  { return signedIn() && request.auth.token.email.matches('d[0-9]+@105numara[.]com'); }
+    // d3@105numara.com → "D3"
+    function myDaire()  { return request.auth.token.email.split('@')[0].upper(); }
+    function ownsDaire(d) { return isSakin() && d == myDaire(); }
+
+    match /ayarlar/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /daireler/{id} {
+      allow read: if isAdmin() || ownsDaire(id);
+      allow write: if isAdmin();
+    }
+    match /odemeler/{id} {
+      allow read: if isAdmin() || ownsDaire(resource.data.daire);
+      allow write: if isAdmin();
+    }
+    match /borclar/{id} {
+      allow read: if isAdmin() || ownsDaire(resource.data.daire);
+      allow write: if isAdmin();
+    }
+    match /gelirler/{id} {
+      allow read, write: if isAdmin();
+    }
+    match /giderler/{id} {
+      allow read, write: if isAdmin();
+    }
+    // Dijital makbuzlar: QR doğrulama sayfası giriş yapmadan tek bir makbuzu kodu ile okur.
+    // Kod tahmin edilemez (20 karakter), listeleme kapalı; kayıtta tam ad / e-posta / telefon tutulmaz.
+    match /makbuzlar/{id} {
+      allow get: if true;
+      allow list, create, update: if isAdmin();
+      allow delete: if false;
+    }
+    // Denetim logu yalnızca eklenebilir: yönetici dahil kimse değiştiremez / silemez.
+    match /auditLog/{id} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}

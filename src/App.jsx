@@ -2,17 +2,23 @@ import { useState, useEffect, useRef } from "react";
 import { db, auth } from "./firebase.js";
 import {
   collection, doc, setDoc, addDoc, deleteDoc, updateDoc,
-  onSnapshot, query, orderBy, serverTimestamp, getDocs, where, increment
+  onSnapshot, query, orderBy, limit, serverTimestamp, getDoc, getDocs, where, increment,
+  writeBatch, runTransaction
 } from "firebase/firestore";
 import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from "firebase/auth";
+import { makbuzNo, maskele } from "../lib/makbuz.js";
 
 const fmt = (n) => new Intl.NumberFormat("tr-TR").format(Math.round(n || 0));
 const MONTH_NAMES  = ["Ocak","Şubat","Mart","Nisan","Mayıs","Haziran","Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"];
 const MONTHS_SHORT = ["Oca","Şub","Mar","Nis","May","Haz","Tem","Ağu","Eyl","Eki","Kas","Ara"];
-const NOW          = new Date();
-const CUR_YEAR     = NOW.getFullYear();
-const CUR_MONTH    = NOW.getMonth();
-const ADMIN_EMAIL  = "huseyinsrn@gmail.com";
+// Her çağrıda güncel tarih: sekme ay sonunda açık kalsa da "bu ay" doğru kalır
+const curYear      = () => new Date().getFullYear();
+const curMonth     = () => new Date().getMonth();
+// Yönetici e-postası istemcide tutulmaz; yetkiyi firestore.rules belirler.
+// Daire hesabı olmayan (dN@105numara.com dışındaki) her hesap yönetici arayüzünü görür,
+// kurallar izin vermezse hiçbir veri okuyamaz.
+const DAIRE_EMAIL  = /^d(\d+)@105numara\.com$/;
+const daireIdOf    = email => { const m = (email || "").toLowerCase().match(DAIRE_EMAIL); return m ? `D${m[1]}` : null; };
 const START_YEAR   = 2026;
 const START_MONTH  = 3;
 const SESSION_TIMEOUT = 12 * 60 * 60 * 1000; // 12 saat hareketsizlik
@@ -29,7 +35,7 @@ function hataMesaji(e) {
 }
 
 const APT_ADI = "Mert Apartmanı No 105";
-const curKey = () => `${CUR_YEAR}-${String(CUR_MONTH + 1).padStart(2, "0")}`;
+const curKey = () => `${curYear()}-${String(curMonth() + 1).padStart(2, "0")}`;
 const bugun  = () => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
 const topla  = l => l.reduce((a, k) => a + (k.tutar || 0), 0);
 const ayOf   = t => (t || "").slice(0, 7);
@@ -65,22 +71,38 @@ function sakinlar(d, bas, son) {
 }
 const sakinAdi = (d, key) => sakinlar(d, key, key);
 
-// Bir dairenin belirli ayki aidat gelir kaydını bulur (iptal / düzeltme için)
+// Yeni ödeme kayıtlarının sabit kimliği: aynı daire/ay için tek belge (örn. D3_2026-05)
+const odemeId = (daireId, key) => `${daireId}_${key}`;
+
+// Eski kayıtlar için: bir dairenin belirli ayki aidat gelirini nottaki metinden bulur
 async function aidatBul(daireId, key, adAy) {
   const gs = (await getDocs(query(collection(db, "gelirler"), where("daire", "==", daireId)))).docs.map(x => ({ id:x.id, ...x.data() }));
   return gs.find(g => g.kaynak === "aidat" && (g.donem === key || (g.not || "").includes(adAy + " aidat")));
 }
 
-function useCol(ad, alan) {
+// Bir ödemeye bağlı aidat gelirini bulur: önce sabit kimlik, sonra odemeId alanı, en son (eski kayıt) not metni
+async function aidatGeliriBul(odeme, adAy) {
+  const sabit = await getDoc(doc(db, "gelirler", `aidat_${odeme.id}`));
+  if (sabit.exists()) return { id:sabit.id, ...sabit.data() };
+  const bagli = await getDocs(query(collection(db, "gelirler"), where("odemeId", "==", odeme.id)));
+  if (!bagli.empty) return { id:bagli.docs[0].id, ...bagli.docs[0].data() };
+  return aidatBul(odeme.daire, odeme.donem, adAy);
+}
+
+function useCol(ad, alan, adet) {
   const [v, setV] = useState([]);
-  useEffect(() => onSnapshot(alan ? query(collection(db, ad), orderBy(alan, "desc")) : collection(db, ad),
-    sn => setV(sn.docs.map(x => ({ id:x.id, ...x.data() }))), e => console.error(ad, e)), [ad, alan]);
+  useEffect(() => {
+    const kisit = [...(alan ? [orderBy(alan, "desc")] : []), ...(adet ? [limit(adet)] : [])];
+    return onSnapshot(kisit.length ? query(collection(db, ad), ...kisit) : collection(db, ad),
+      sn => setV(sn.docs.map(x => ({ id:x.id, ...x.data() }))), e => console.error(ad, e));
+  }, [ad, alan, adet]);
   return v;
 }
 
+// Başlangıçtan bu yılın sonrasına kadar (yıl sınırı yok)
 function tumAylar() {
   const list = [];
-  for (let y = START_YEAR; y <= START_YEAR + 3; y++) {
+  for (let y = START_YEAR; y <= Math.max(START_YEAR, curYear()) + 1; y++) {
     const mStart = y === START_YEAR ? START_MONTH : 0;
     for (let m = mStart; m < 12; m++) {
       list.push({ y, m, key:`${y}-${String(m + 1).padStart(2,"0")}` });
@@ -90,12 +112,13 @@ function tumAylar() {
 }
 
 function gecmisAylar() {
-  return tumAylar().filter(a => a.y < CUR_YEAR || (a.y === CUR_YEAR && a.m <= CUR_MONTH));
+  const cur = curKey();
+  return tumAylar().filter(a => a.key <= cur);
 }
 
 const DAIRES_SEED = Array.from({ length:10 }, (_,i) => ({
   id:`D${i+1}`, username:`d${i+1}`, ad:`Daire ${i+1}`,
-  email:`d${i+1}@105numara.com`, sakinAd:"", tel:"", aktif:true,
+  email:`d${i+1}@105numara.com`, sakinAd:"", tel:"", mail:"", aktif:true,
 }));
 
 const DURUM_LABEL = { odendi:"Ödendi", bekliyor:"Bekliyor", gecikti:"Gecikmiş" };
@@ -113,7 +136,14 @@ export default function App() {
   const [ayarlar,  setAyarlar]  = useState(null);
   const [dbReady,  setDbReady]  = useState(false);
   const [dbError,  setDbError]  = useState("");
+  const [ayKey,    setAyKey]    = useState(curKey);
   const sessionTimeoutRef = useRef(null);
+
+  // Ay değişince paneller yeniden kurulur (varsayılan ay/yıl seçimleri güncellenir)
+  useEffect(() => {
+    const t = setInterval(() => setAyKey(curKey()), 60 * 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // Oturum durumu
   useEffect(() => {
@@ -158,7 +188,7 @@ export default function App() {
       setDaireler([]); setAyarlar(null); setDbReady(false); setDbError("");
       return;
     }
-    const admin = user.email === ADMIN_EMAIL;
+    const benimDaire = daireIdOf(user.email), admin = !benimDaire;
     setDbError("");
 
     const unsubAyar = onSnapshot(doc(db,"ayarlar","genel"), async snap => {
@@ -170,15 +200,25 @@ export default function App() {
       } catch (e) { console.error(e); setDbError(hataMesaji(e)); }
     }, e => { console.error(e); setDbError(hataMesaji(e)); });
 
+    const hata = e => { console.error(e); setDbError(hataMesaji(e)); };
+
+    // Sakin yalnızca kendi daire belgesini okuyabilir (firestore.rules)
+    if (!admin) {
+      const unsubKendi = onSnapshot(doc(db,"daireler",benimDaire), snap => {
+        setDaireler(snap.exists() ? [{ id:snap.id, ...snap.data() }] : []);
+        setDbReady(true);
+      }, hata);
+      return () => { unsubAyar(); unsubKendi(); };
+    }
+
     const unsubDaire = onSnapshot(collection(db,"daireler"), async snap => {
       try {
         if (snap.empty) {
           if (snap.metadata.fromCache) return; // sunucu yanıtını bekle
-          if (admin) {
-            for (const d of DAIRES_SEED) await setDoc(doc(db,"daireler",d.id), d);
-            return; // seed sonrası snapshot tekrar tetiklenir
-          }
-          setDaireler([]); setDbReady(true);
+          const b = writeBatch(db);
+          DAIRES_SEED.forEach(d => b.set(doc(db,"daireler",d.id), d));
+          await b.commit();
+          return; // seed sonrası snapshot tekrar tetiklenir
         } else {
           setDaireler(snap.docs.map(d => ({ id:d.id, ...d.data() })));
           setDbReady(true);
@@ -194,11 +234,11 @@ export default function App() {
   if (dbError) return <HataEkrani mesaj={dbError} />;
   if (!dbReady || !ayarlar) return <Splash />;
 
-  const isAdmin    = user.email === ADMIN_EMAIL;
-  const daire      = daireler.find(d => d.email === user.email);
-  
-  if (isAdmin) return <AdminPanel daireler={daireler} ayarlar={ayarlar} />;
-  if (daire)   return <DairePanel daire={daire} ayarlar={ayarlar} />;
+  const benimDaire = daireIdOf(user.email);
+  const daire      = benimDaire && daireler.find(d => d.id === benimDaire);
+
+  if (!benimDaire) return <AdminPanel key={ayKey} daireler={daireler} ayarlar={ayarlar} />;
+  if (daire)       return <DairePanel key={ayKey} daire={daire} ayarlar={ayarlar} />;
   return <HataEkrani mesaj="Hesap bir daireyle eşleşmiyor." />;
 }
 
@@ -241,8 +281,8 @@ function Login() {
     setHata(""); setLoading(true);
     try {
       const u = username.trim().toLowerCase();
-      const email = (u==="admin"||u===ADMIN_EMAIL.toLowerCase()) ? ADMIN_EMAIL
-        : u.includes("@") ? u : `${u}@105numara.com`;
+      // Daireler kısa ad (d3), yönetici tam e-posta ile girer
+      const email = u.includes("@") ? u : `${u}@105numara.com`;
       await signInWithEmailAndPassword(auth, email, sifre);
     } catch (e) {
       console.error(e);
@@ -263,7 +303,7 @@ function Login() {
           <div style={{ fontSize:44,marginBottom:8 }}>🏢</div>
           <h1 style={S.loginTitle}>{APT_ADI}</h1>
         </div>
-        <div style={S.field}><label style={S.label}>Kullanıcı Adı</label>
+        <div style={S.field}><label style={S.label}>Kullanıcı Adı / E-posta</label>
           <input style={S.input} autoCapitalize="none" value={username}
             onChange={e=>setUsername(e.target.value)} onKeyDown={e=>e.key==="Enter"&&giris()}/></div>
         <div style={S.field}><label style={S.label}>Şifre</label>
@@ -405,20 +445,13 @@ function TabAidat({ daireler, ayarlar }) {
     const v = Number(tutarStr);
     if (tutarStr==="" || !(v>=0)) return alert("Geçerli bir tutar girin.");
     const hedef = (uygula ? AYLAR.slice(idx) : [ay]).map(a=>a.key);
-    await setDoc(doc(db,"ayarlar","genel"), { aylikAidat:Object.fromEntries(hedef.map(k=>[k,v])) }, { merge:true });
-    logAction(`${ad} aidat tutarı: ₺${v}${uygula?" (sonraki aylar dahil)":""}`, "aidat_update");
-    // Eski tutarla ödenmiş kayıtlar varsa, tek seferde yeni tutara çek
-    const eski = odemeler.filter(o=>o.durum==="odendi" && hedef.includes(o.donem))
-      .map(o=>({ o, yeni:v })).filter(x=>x.yeni !== x.o.tutar);
-    if (eski.length && window.confirm(`${eski.length} ödenmiş kayıt eski tutarda görünüyor. Yeni tutara (₺${fmt(v)}) göre güncellensin mi?`)) {
-      for (const { o, yeni } of eski) {
-        await updateDoc(doc(db,"odemeler",o.id), { tutar:yeni });
-        const g = await aidatBul(o.daire, o.donem, o.donemAd || ayAdi(o.donem));
-        if (g) await updateDoc(doc(db,"gelirler",g.id), { tutar:yeni });
-      }
-      logAction(`${eski.length} ödenmiş aidat kaydı ₺${v} üzerinden güncellendi`, "aidat_update");
-    }
-    alert("Kaydedildi.");
+    // Tahsil edilmiş aidat kayıtları bilerek değiştirilmez; yeni tutar yalnızca ödenmemiş aylara uygulanır
+    const b = writeBatch(db);
+    b.set(doc(db,"ayarlar","genel"), { aylikAidat:Object.fromEntries(hedef.map(k=>[k,v])) }, { merge:true });
+    logEkle(b, `${ad} aidat tutarı: ₺${v}${uygula?" (sonraki aylar dahil)":""}`, "aidat_update");
+    await b.commit();
+    const eskiTutarli = odemeler.filter(o=>o.durum==="odendi" && hedef.includes(o.donem) && o.tutar!==v).length;
+    alert("Kaydedildi." + (eskiTutarli ? `\n${eskiTutarli} ödenmiş kayıt tahsil edildiği tutarda kaldı.` : ""));
   }
 
   async function toggle(d) {
@@ -427,17 +460,43 @@ function TabAidat({ daireler, ayarlar }) {
     try {
       const mevcut = om[d.id];
       if (mevcut) {
-        const gelir = await aidatBul(d.id, key, ad);
-        await deleteDoc(doc(db,"odemeler",mevcut.id));
-        if (gelir) await deleteDoc(doc(db,"gelirler",gelir.id));
-        logAction(`${d.id} ${ad} ödeme iptal`, "odeme_cancel");
+        const gelir = await aidatGeliriBul(mevcut, ad);
+        const b = writeBatch(db);
+        b.delete(doc(db,"odemeler",mevcut.id));
+        if (gelir) b.delete(doc(db,"gelirler",gelir.id));
+        // Makbuz silinmez, iptal olarak işaretlenir: QR ile bakan "iptal edildi" görür
+        if (mevcut.makbuzId) b.update(doc(db,"makbuzlar",mevcut.makbuzId), { iptal:true, iptalTarihi:bugun() });
+        logEkle(b, `${d.id} ${ad} ödeme iptal${mevcut.makbuzNo?` (makbuz ${mevcut.makbuzNo} iptal)`:""}`, "odeme_cancel");
+        await b.commit();
       } else {
+        // Eski düzende rastgele kimlikle girilmiş kayıt var mı? (ekrana henüz yansımamış olabilir)
+        const eski = await getDocs(query(collection(db,"odemeler"), where("daire","==",d.id), where("donem","==",key)));
+        if (eski.docs.some(x=>x.data().durum==="odendi")) return alert(`${d.id} ${ad} zaten ödenmiş görünüyor.`);
         const tutar = aidat, sakin = sakinAdi(d, key);
-        const ref = await addDoc(collection(db,"odemeler"), { daire:d.id, donem:key, donemAd:ad, tutar, durum:"odendi", tarih:bugun(), sakinAd:sakin, olusturuldu:serverTimestamp() });
-        await addDoc(collection(db,"gelirler"), { kaynak:"aidat", daire:d.id, donem:key, odemeId:ref.id, tutar, tarih:bugun(), not:`${d.id} ${sakin} - ${ad} aidatı`, otomatik:true, olusturuldu:serverTimestamp() });
-        logAction(`${d.id} ${ad} ödeme kaydı`, "odeme_record");
+        const odemeRef = doc(db,"odemeler",odemeId(d.id,key)), gelirRef = doc(db,"gelirler",`aidat_${odemeId(d.id,key)}`);
+        // Sabit kimlik + transaction: aynı daire/ay iki kez ödenemez; ödeme, gelir ve log birlikte yazılır
+        await runTransaction(db, async tx => {
+          if ((await tx.get(odemeRef)).exists()) throw new Error(`${d.id} ${ad} zaten ödenmiş.`);
+          tx.set(odemeRef, { daire:d.id, donem:key, donemAd:ad, tutar, durum:"odendi", tarih:bugun(), sakinAd:sakin, olusturuldu:serverTimestamp() });
+          tx.set(gelirRef, { kaynak:"aidat", daire:d.id, donem:key, odemeId:odemeRef.id, tutar, tarih:bugun(), not:`${d.id} ${sakin} - ${ad} aidatı`, otomatik:true, olusturuldu:serverTimestamp() });
+          logEkle(tx, `${d.id} ${ad} ödeme kaydı`, "odeme_record");
+        });
       }
+    } catch (e) {
+      console.error(e);
+      alert("İşlem başarısız: " + hataMesaji(e));
     } finally { setBusy(false); }
+  }
+
+  async function makbuzGonder(d) {
+    const o = om[d.id];
+    if (!o || busy) return;
+    if (!MAIL_RE.test(d.mail || "")) return alert(`${d.id} için e-posta adresi girilmemiş.\nAyarlar → Daire Sakinleri → Düzelt ile ekleyin.`);
+    if (!window.confirm(`${d.id} · ${sakinAdi(d,key)}\n${d.mail} adresine ${ad} makbuzu ${o.makbuzGonderim?"TEKRAR ":""}gönderilsin mi?`)) return;
+    setBusy(true);
+    try { alert(gonderimOzeti(await makbuzlariGonder([o]))); }
+    catch (e) { console.error(e); alert("Makbuz gönderilemedi: " + hataMesaji(e)); }
+    finally { setBusy(false); }
   }
 
   return (
@@ -457,7 +516,7 @@ function TabAidat({ daireler, ayarlar }) {
           <label style={{ display:"flex",gap:8,alignItems:"center",fontSize:12,color:"#6B7280",marginTop:10 }}>
             <input type="checkbox" checked={uygula} onChange={e=>setUygula(e.target.checked)}/> Sonraki aylara da uygula
           </label>
-          <div style={{ fontSize:11,color:"#9CA3AF",marginTop:6 }}>Yalnızca bu ayı etkiler; ödenmiş kayıtlar ve önceki aylar değişmez.</div>
+          <div style={{ fontSize:11,color:"#9CA3AF",marginTop:6 }}>Yalnızca seçilen ay(lar)ı etkiler; ödenmiş kayıtlar tahsil edildiği tutarda kalır.</div>
         </div>
       </div>
       {gelecek ? (
@@ -475,8 +534,15 @@ function TabAidat({ daireler, ayarlar }) {
                     <td style={S.td}>{sakinAdi(d,key)}</td>
                     <td style={S.td}>₺{fmt(om[d.id]?om[d.id].tutar:aidat)}{eksikOf(d.id)>0 && <div style={{ fontSize:10,color:"#D85A30" }}>alacak ₺{fmt(eksikOf(d.id))}</div>}</td>
                     <td style={S.td}>{om[d.id]?.tarih||"—"}</td>
-                    <td style={S.td}><span style={{ ...S.badge,...DURUM_STIL[d.durum] }}>{DURUM_LABEL[d.durum]}</span></td>
-                    <td style={S.td}>
+                    <td style={S.td}><span style={{ ...S.badge,...DURUM_STIL[d.durum] }}>{DURUM_LABEL[d.durum]}</span>
+                      {om[d.id]?.makbuzGonderim && <div style={{ fontSize:10,color:"#1E40AF",marginTop:3 }} title={`${om[d.id].makbuzNo} → ${om[d.id].makbuzGonderim.email}`}>📧 {om[d.id].makbuzGonderim.tarih.slice(8)}.{om[d.id].makbuzGonderim.tarih.slice(5,7)} gönderildi</div>}</td>
+                    <td style={{ ...S.td,whiteSpace:"nowrap",textAlign:"right" }}>
+                      {d.durum==="odendi" && (
+                        <button style={{ ...S.smallBtn,fontSize:11,marginRight:6,borderColor:"#93C5FD",color:"#1E40AF" }} disabled={busy}
+                          title={d.mail ? `Makbuzu ${d.mail} adresine gönder` : "E-posta adresi yok (Ayarlar)"} onClick={()=>makbuzGonder(d)}>
+                          📧 {om[d.id]?.makbuzGonderim ? "Tekrar gönder" : "Makbuz gönder"}
+                        </button>
+                      )}
                       <button style={{ ...S.smallBtn,fontSize:11,borderColor:d.durum==="odendi"?"#fca5a5":"#6ee7b7",color:d.durum==="odendi"?"#991B1B":"#065F46" }} disabled={busy} onClick={()=>toggle(d)}>
                         {d.durum==="odendi"?"İptal":"✓ Ödendi"}
                       </button>
@@ -544,10 +610,10 @@ function Kolon({ baslik, koleksiyon, alan, secenekler, liste, renk, isaret, ay }
 
 function TabGelirGider() {
   const gelirler = useCol("gelirler","tarih"), giderler = useCol("giderler","tarih");
-  const [yil,setYil] = useState(CUR_YEAR);
-  const [ay,setAy] = useState(CUR_MONTH);
+  const [yil,setYil] = useState(curYear);
+  const [ay,setAy] = useState(curMonth);
   const mKey = m => `${yil}-${String(m+1).padStart(2,"0")}`;
-  const yillar = [...new Set([String(CUR_YEAR), ...gelirler.map(k=>gelirAy(k).slice(0,4)), ...giderler.map(k=>ayOf(k.tarih).slice(0,4))])].filter(Boolean).sort().reverse().map(Number);
+  const yillar = [...new Set([String(curYear()), ...gelirler.map(k=>gelirAy(k).slice(0,4)), ...giderler.map(k=>ayOf(k.tarih).slice(0,4))])].filter(Boolean).sort().reverse().map(Number);
   const dolu = new Set([...gelirler.map(gelirAy), ...giderler.map(k=>ayOf(k.tarih))]);
   const sec = ay==="tumu" ? "tumu" : mKey(ay);
   const uyar = key => sec==="tumu" ? key.startsWith(`${yil}-`) : key===sec;
@@ -599,21 +665,24 @@ function TabBorclar({ daireler }) {
   // Eski düzen: eksik tutar aidat gelirinden düşülmüş, tahsilat ayrı gelir olarak eklenmişti → yeni düzene çevir
   async function donustur() {
     if (!window.confirm(`${eski.length} eski kayıt yeni düzene çevrilecek (aidat geliri tam tutara döner, tahsilat gelirleri silinir). Devam edilsin mi?`)) return;
+    // Her borç kaydı kendi batch'inde: bir kayıt yarıda kalırsa kısmen değişmiş kayıt oluşmaz
     for (const b of eski) {
       const kalan = Math.max(0,(b.eksik||0)-(b.odenen||0));
       let eksik = b.eksik || 0;
+      const w = writeBatch(db);
       const od = odemeler.find(o=>o.daire===b.daire && o.donem===b.donem && o.durum==="odendi");
       if (od) {
-        await updateDoc(doc(db,"odemeler",od.id), { tutar:increment(eksik) });
-        const g = await aidatBul(b.daire, b.donem, b.donemAd || ayAdi(b.donem));
-        if (g) await updateDoc(doc(db,"gelirler",g.id), { tutar:increment(eksik) });
+        w.update(doc(db,"odemeler",od.id), { tutar:increment(eksik) });
+        const g = await aidatGeliriBul(od, b.donemAd || ayAdi(b.donem));
+        if (g) w.update(doc(db,"gelirler",g.id), { tutar:increment(eksik) });
         const tahs = await getDocs(query(collection(db,"gelirler"), where("borcId","==",b.id)));
-        for (const t of tahs.docs) await deleteDoc(t.ref);
+        tahs.docs.forEach(t => w.delete(t.ref));
         if (kalan>0) eksik = kalan;
       }
-      await updateDoc(doc(db,"borclar",b.id), { model:2, eksik, kapali:kalan===0, kapanis:kalan===0?bugun():"" });
+      w.update(doc(db,"borclar",b.id), { model:2, eksik, kapali:kalan===0, kapanis:kalan===0?bugun():"" });
+      logEkle(w, `${b.daire} ${b.donemAd||b.donem} eski borç kaydı yeni düzene çevrildi`, "borc_migrate");
+      await w.commit();
     }
-    logAction(`${eski.length} eski borç kaydı yeni düzene çevrildi`, "borc_migrate");
   }
 
   const liste = borclar.filter(b=>f==="tumu" || (f==="acik"?kalanOf(b)>0:kalanOf(b)===0))
@@ -748,13 +817,13 @@ function Donut({ baslik, liste, toplam }) {
 
 function TabRapor({ daireler }) {
   const odemeler = useCol("odemeler"), gelirler = useCol("gelirler","tarih"), giderler = useCol("giderler","tarih"), borclar = useCol("borclar");
-  const [yil,setYil] = useState(CUR_YEAR);
+  const [yil,setYil] = useState(curYear);
   const [ay,setAy] = useState("tumu");
   const cur = curKey(), startKey = gecmisAylar()[0].key;
   const mKey = m => `${yil}-${String(m+1).padStart(2,"0")}`;
   const bas = ay==="tumu" ? mKey(0) : mKey(ay), son = ay==="tumu" ? mKey(11) : mKey(ay);
   const inP = key => key >= bas && key <= son;
-  const yillar = [...new Set([String(CUR_YEAR), ...gelirler.map(gelirAy).map(k=>k.slice(0,4)), ...giderler.map(k=>ayOf(k.tarih).slice(0,4))])].filter(Boolean).sort().reverse().map(Number);
+  const yillar = [...new Set([String(curYear()), ...gelirler.map(gelirAy).map(k=>k.slice(0,4)), ...giderler.map(k=>ayOf(k.tarih).slice(0,4))])].filter(Boolean).sort().reverse().map(Number);
   const gel = gelirler.filter(k=>inP(gelirAy(k))), gid = giderler.filter(k=>inP(ayOf(k.tarih)));
   const tG = topla(gel), tD = topla(gid);
   const alacak = borclar.filter(b=>inP(b.donem)).reduce((a,b)=>a+acikTutar(b),0);
@@ -786,6 +855,28 @@ function TabRapor({ daireler }) {
     if (key > cur) return { bg:"#F3F4F6", t:"Henüz gelmedi" };
     return key === cur ? { bg:"#F5B942", t:"Bekliyor" } : { bg:"#E5484D", t:"Gecikmiş" };
   };
+  // Seçili ayın makbuzları: ödeyenler, e-postası olanlar, henüz gönderilmemişler
+  const dMap = Object.fromEntries(daireler.map(d=>[d.id,d]));
+  const odeyenler = ay==="tumu" ? [] : odemeler.filter(o=>o.donem===mKey(ay) && o.durum==="odendi").sort((a,b)=>a.daire.localeCompare(b.daire,"tr",{numeric:true}));
+  const mailli = odeyenler.filter(o=>MAIL_RE.test(dMap[o.daire]?.mail || ""));
+  const gonderilmemis = mailli.filter(o=>!o.makbuzGonderim);
+  const [gonderiyor,setGonderiyor] = useState(false);
+  async function topluGonder() {
+    const hedef = gonderilmemis.length ? gonderilmemis : mailli;
+    const eksik = odeyenler.filter(o=>!mailli.includes(o)).map(o=>o.daire);
+    const soru = [
+      `${donem} makbuzları ${hedef.length} daireye ${gonderilmemis.length ? "" : "TEKRAR "}gönderilecek:`,
+      hedef.map(o=>`${o.daire} → ${dMap[o.daire].mail}`).join("\n"),
+      eksik.length ? `\nE-postası olmadığı için atlanacak: ${eksik.join(", ")}` : "",
+      "\nDevam edilsin mi?",
+    ].join("\n");
+    if (!window.confirm(soru)) return;
+    setGonderiyor(true);
+    try { alert(gonderimOzeti(await makbuzlariGonder(hedef))); }
+    catch (e) { console.error(e); alert("Makbuzlar gönderilemedi: " + hataMesaji(e)); }
+    finally { setGonderiyor(false); }
+  }
+
   const Liste = ({ baslik, liste, alan, renk }) => (
     <div style={S.card}>
       <div style={S.cardTitle}>{baslik}</div>
@@ -808,6 +899,22 @@ function TabRapor({ daireler }) {
       </div>
       <Chips secili={yil} onChange={v=>{ setYil(v); setAy("tumu"); }} items={yillar.map(y=>({v:y,l:String(y)}))}/>
       <Chips secili={ay} onChange={setAy} items={[{v:"tumu",l:"Tüm yıl"}, ...MONTHS_SHORT.map((l,m)=>({v:m,l}))]}/>
+
+      <div className="no-print" style={{ ...S.card,display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap",borderLeft:"3px solid #3B82F6" }}>
+        <div>
+          <div style={S.cardTitle}>📧 Dijital Makbuzlar · {ay==="tumu" ? "ay seçin" : donem}</div>
+          <div style={{ fontSize:12,color:"#6B7280",marginTop:4 }}>
+            {ay==="tumu" ? "Makbuz göndermek için yukarıdan bir ay seçin."
+              : `Ödeyen ${odeyenler.length} · e-postası olan ${mailli.length} · gönderilmiş ${mailli.length-gonderilmemis.length}`}
+          </div>
+        </div>
+        {ay!=="tumu" && (
+          <button style={{ ...S.addBtn,background:"linear-gradient(135deg,#3B82F6,#1D4ED8)",boxShadow:"0 2px 8px rgba(59,130,246,.3)",opacity:(gonderiyor||!mailli.length)?.6:1 }}
+            disabled={gonderiyor || !mailli.length} onClick={topluGonder}>
+            {gonderiyor ? "Gönderiliyor..." : gonderilmemis.length ? `Makbuzları gönder (${gonderilmemis.length})` : mailli.length ? "Tümünü tekrar gönder" : "E-posta adresi yok"}
+          </button>
+        )}
+      </div>
 
       <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(135px,1fr))",gap:12,marginBottom:16 }}>
         <MetricCard label="Toplam Gelir" val={`₺${fmt(tG)}`} color="#1D9E75"/>
@@ -877,15 +984,25 @@ function TabRapor({ daireler }) {
 // ── AYARLAR: Daire sakinleri + denetim logu ───────────────────────────────
 function TabAyarlar({ daireler }) {
   const [alt,setAlt] = useState("daireler");
-  const logs = useCol("auditLog","olusturuldu");
+  const logs = useCol("auditLog","olusturuldu",50);
+  const [yedekDurum,setYedekDurum] = useState("");
+  async function yedekAl() {
+    setYedekDurum("Hazırlanıyor...");
+    try {
+      const ozet = await yedekIndir();
+      setYedekDurum(`İndirildi (${ozet})`);
+      logAction("Veri yedeği indirildi", "backup");
+    } catch (e) { console.error(e); setYedekDurum("Yedek alınamadı: " + hataMesaji(e)); }
+  }
   const [sec,setSec] = useState(null);
   const [mod,setMod] = useState("degistir");
-  const [f,setF] = useState({ ad:"", tel:"", bas:curKey() });
+  const [f,setF] = useState({ ad:"", tel:"", mail:"", bas:curKey() });
   const cur = curKey(), AYLAR = tumAylar();
-  function ac(d, m) { setSec(d); setMod(m); setF({ ad:m==="duzenle"?sakinAdi(d,cur):"", tel:m==="duzenle"?(d.tel||""):"", bas:cur }); }
+  function ac(d, m) { const dz = m==="duzenle"; setSec(d); setMod(m); setF({ ad:dz?sakinAdi(d,cur):"", tel:dz?(d.tel||""):"", mail:dz?(d.mail||""):"", bas:cur }); }
   async function kaydet() {
-    const ad = f.ad.trim();
+    const ad = f.ad.trim(), mail = f.mail.trim().toLowerCase();
     if (!ad) return alert("Sakin adını girin.");
+    if (mail && !MAIL_RE.test(mail)) return alert("E-posta adresi geçerli görünmüyor.");
     const g = sec.sakinGecmis?.length ? [...sec.sakinGecmis] : [{ ad:sec.sakinAd||sec.ad, baslangic:"0000-00" }];
     let yeni;
     if (mod==="duzenle") { // yazım düzeltmesi: şu an geçerli kaydın adını düzeltir
@@ -894,13 +1011,24 @@ function TabAyarlar({ daireler }) {
     } else { // sakin değişimi: eski kayıtlar korunur, yeni ad seçilen aydan itibaren geçerli
       yeni = [...g.filter(e=>e.baslangic!==f.bas), { ad, baslangic:f.bas }].sort((a,b)=>a.baslangic.localeCompare(b.baslangic));
     }
-    await updateDoc(doc(db,"daireler",sec.id), { sakinGecmis:yeni, sakinAd:sakinAdi({ ...sec, sakinGecmis:yeni }, cur), tel:f.tel });
+    await updateDoc(doc(db,"daireler",sec.id), { sakinGecmis:yeni, sakinAd:sakinAdi({ ...sec, sakinGecmis:yeni }, cur), tel:f.tel, mail });
     logAction(`${sec.id} ${mod==="duzenle"?"düzeltme":"sakin değişimi"}: ${ad}${mod==="degistir"?` (${ayAdi(f.bas)}'den itibaren)`:""}`, "daire_update");
     setSec(null);
   }
   return (
     <div>
-      <Chips secili={alt} onChange={setAlt} items={[{v:"daireler",l:"🏠 Daire Sakinleri"},{v:"audit",l:"📜 Denetim Logu"}]}/>
+      <Chips secili={alt} onChange={setAlt} items={[{v:"daireler",l:"🏠 Daire Sakinleri"},{v:"audit",l:"📜 Denetim Logu"},{v:"yedek",l:"💾 Yedek"}]}/>
+      {alt==="yedek" && (
+        <div style={S.card}>
+          <div style={S.cardTitle}>💾 Veri Yedeği</div>
+          <div style={{ fontSize:12,color:"#6B7280",margin:"8px 0 12px",lineHeight:1.5 }}>
+            Tüm kayıtları (daireler, ödemeler, gelir-gider, borçlar, ayarlar, denetim logu) tek bir JSON dosyası olarak indirir.
+            Büyük değişikliklerden önce ve ayda bir alıp güvenli bir yerde saklayın.
+          </div>
+          <button style={S.addBtn} onClick={yedekAl} disabled={yedekDurum==="Hazırlanıyor..."}>Yedeği indir (JSON)</button>
+          {yedekDurum && <div style={{ fontSize:12,color:"#6B7280",marginTop:10 }}>{yedekDurum}</div>}
+        </div>
+      )}
       {alt==="daireler" && (
         <>
           {sec && (
@@ -909,6 +1037,7 @@ function TabAyarlar({ daireler }) {
               <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:8 }}>
                 <div><label style={S.label}>{mod==="duzenle"?"Ad Soyad":"Yeni sakin adı"}</label><input style={S.input} value={f.ad} onChange={e=>setF(p=>({...p,ad:e.target.value}))}/></div>
                 <div><label style={S.label}>Telefon</label><input style={S.input} value={f.tel} onChange={e=>setF(p=>({...p,tel:e.target.value}))}/></div>
+                <div><label style={S.label}>E-posta (makbuz için)</label><input style={S.input} type="email" inputMode="email" autoCapitalize="none" placeholder="ornek@mail.com" value={f.mail} onChange={e=>setF(p=>({...p,mail:e.target.value}))}/></div>
                 {mod==="degistir" && <div><label style={S.label}>Geçerli olduğu ilk ay</label>
                   <select style={S.select} value={f.bas} onChange={e=>setF(p=>({...p,bas:e.target.value}))}>{AYLAR.map(a=><option key={a.key} value={a.key}>{MONTH_NAMES[a.m]} {a.y}</option>)}</select></div>}
               </div>
@@ -922,12 +1051,13 @@ function TabAyarlar({ daireler }) {
           <div style={S.card}>
             <div style={S.cardTitle}>🏠 Daire Sakinleri</div>
             <table style={S.table}>
-              <thead><tr><th style={S.th}>Daire</th><th style={S.th}>Sakin</th><th style={S.th}>Telefon</th><th style={S.th}></th></tr></thead>
+              <thead><tr><th style={S.th}>Daire</th><th style={S.th}>Sakin</th><th style={S.th}>Telefon</th><th style={S.th}>E-posta</th><th style={S.th}></th></tr></thead>
               <tbody>{daireler.map(d=>(
                 <tr key={d.id}>
                   <td style={S.td}><b>{d.id}</b></td>
                   <td style={S.td}>{sakinAdi(d,cur)}{(d.sakinGecmis||[]).length>1 && <div style={{ fontSize:10,color:"#9CA3AF" }}>Önceki: {d.sakinGecmis.filter(e=>e.baslangic<=cur).slice(0,-1).map(e=>e.ad).join(", ")||"—"}</div>}</td>
                   <td style={S.td}>{d.tel||"—"}</td>
+                  <td style={{ ...S.td,fontSize:12,wordBreak:"break-all" }}>{d.mail || <span style={{ color:"#D85A30" }}>eklenmedi</span>}</td>
                   <td style={{ ...S.td,whiteSpace:"nowrap" }}>
                     <button style={{ ...S.smallBtn,fontSize:11,marginRight:6 }} onClick={()=>ac(d,"duzenle")}>Düzelt</button>
                     <button style={{ ...S.smallBtn,fontSize:11,borderColor:"#93C5FD",color:"#1E40AF" }} onClick={()=>ac(d,"degistir")}>Sakin Değiştir</button>
@@ -940,10 +1070,10 @@ function TabAyarlar({ daireler }) {
       )}
       {alt==="audit" && (
         <div style={S.card}>
-          <div style={S.cardTitle}>📜 Denetim Logu (Son 30)</div>
+          <div style={S.cardTitle}>📜 Denetim Logu (Son 50)</div>
           {logs.length===0 ? <Bos t="Kayıt yok"/> : (
             <table style={S.table}><thead><tr><th style={S.th}>Tarih</th><th style={S.th}>Saat</th><th style={S.th}>Detay</th></tr></thead>
-              <tbody>{logs.slice(0,30).map(l=>(<tr key={l.id}><td style={S.td}>{l.tarih}</td><td style={S.td}>{l.saat}</td><td style={S.td}>{l.detay}</td></tr>))}</tbody></table>
+              <tbody>{logs.map(l=>(<tr key={l.id}><td style={S.td}>{l.tarih}</td><td style={S.td}>{l.saat}</td><td style={S.td}>{l.detay}</td></tr>))}</tbody></table>
           )}
         </div>
       )}
@@ -999,16 +1129,107 @@ function DairePanel({ daire, ayarlar }) {
   );
 }
 
+function logKaydi(detay, tur) {
+  const user = auth.currentUser;
+  const kullanici = daireIdOf(user?.email) ? user.email.split("@")[0] : "admin";
+  return { kullanici, detay, tur, tarih:bugun(), saat:new Date().toLocaleTimeString("tr-TR"), olusturuldu:serverTimestamp() };
+}
+
+// Log kaydını bir batch / transaction'a ekler: işlemle birlikte yazılır ya da hiç yazılmaz
+function logEkle(yazici, detay, tur) {
+  yazici.set(doc(collection(db,"auditLog")), logKaydi(detay, tur));
+}
+
 async function logAction(detay, tur) {
   try {
-    const user = auth.currentUser;
-    if (!user) return;
-    const kullanici = user.email === ADMIN_EMAIL ? "admin" : user.email.split("@")[0];
-    await addDoc(collection(db,"auditLog"),{
-      kullanici, detay, tur, tarih:new Date().toISOString().slice(0,10),
-      saat:new Date().toLocaleTimeString("tr-TR"), olusturuldu:serverTimestamp()
-    });
+    if (!auth.currentUser) return;
+    await addDoc(collection(db,"auditLog"), logKaydi(detay, tur));
   } catch (e) { console.error("auditLog yazılamadı:", e); }
+}
+
+// ── DİJİTAL MAKBUZ ────────────────────────────────────────────────────────
+const MAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Ödemenin makbuzunu bir kez düzenler (yıl içinde sıralı numara + tahmin edilemez doğrulama kodu).
+// Makbuz zaten varsa aynı kodu döndürür: tekrar gönderimde numara değişmez.
+async function makbuzHazirla(odeme) {
+  return runTransaction(db, async tx => {
+    const oRef = doc(db,"odemeler",odeme.id), sRef = doc(db,"ayarlar","makbuzSayac");
+    const o = await tx.get(oRef), s = await tx.get(sRef);
+    if (!o.exists() || o.data().durum !== "odendi") throw new Error("ödeme kaydı bulunamadı");
+    const od = o.data();
+    if (od.makbuzId) return od.makbuzId;
+    const yil = curYear(), sira = (s.exists() ? Number(s.data()[yil] || 0) : 0) + 1, no = makbuzNo(yil, sira);
+    const mRef = doc(collection(db,"makbuzlar"));  // 20 karakterlik rastgele kod = QR doğrulama anahtarı
+    const donemAd = od.donemAd || ayAdi(od.donem);
+    tx.set(sRef, { [yil]:sira }, { merge:true });
+    // Herkese açık kayıt: tam ad, e-posta, telefon yok
+    tx.set(mRef, { no, daire:od.daire, donem:od.donem, donemAd, tutar:od.tutar, odemeTarihi:od.tarih || "",
+      duzenlenme:bugun(), sakinMaskeli:maskele(od.sakinAd), odemeId:o.id, iptal:false, olusturuldu:serverTimestamp() });
+    tx.update(oRef, { makbuzId:mRef.id, makbuzNo:no });
+    logEkle(tx, `${od.daire} ${donemAd} makbuz düzenlendi: ${no}`, "makbuz_create");
+    return mRef.id;
+  });
+}
+
+// Makbuzları hazırlar ve /api/makbuz-gonder ile e-postalar; başarılı gönderimleri kaydeder
+async function makbuzlariGonder(odemeler) {
+  const hatalar = [], hazir = [];
+  for (const o of odemeler) {
+    try { hazir.push({ o, kod:await makbuzHazirla(o) }); }
+    catch (e) { hatalar.push(`${o.daire}: ${e.message}`); }
+  }
+  const token = await auth.currentUser.getIdToken();
+  const sonuc = [];
+  let onizleme = false;
+  for (let i = 0; i < hazir.length; i += 10) {
+    const parca = hazir.slice(i, i + 10);
+    const r = await fetch("/api/makbuz-gonder", {
+      method:"POST", headers:{ "Content-Type":"application/json", Authorization:`Bearer ${token}` },
+      body:JSON.stringify({ makbuzlar:parca.map(x=>x.kod) }),
+    });
+    const j = await r.json().catch(() => ({ hata:`Sunucu yanıtı okunamadı (${r.status})` }));
+    if (!r.ok) throw new Error(j.hata || `Gönderim başarısız (${r.status})`);
+    onizleme = j.onizleme;
+    sonuc.push(...j.sonuc.map(s => ({ ...s, o:parca.find(x=>x.kod===s.kod).o })));
+  }
+  const ok = sonuc.filter(s=>s.durum==="gonderildi");
+  if (ok.length) {
+    const b = writeBatch(db);
+    ok.forEach(s => {
+      b.update(doc(db,"odemeler",s.o.id), { makbuzGonderim:{ email:s.email, tarih:bugun(), saat:new Date().toLocaleTimeString("tr-TR"), onizleme } });
+      b.update(doc(db,"makbuzlar",s.kod), { gonderimSayisi:increment(1), sonGonderim:bugun() });
+    });
+    logEkle(b, `${ok.length} makbuz e-postayla ${onizleme?"(önizleme) ":""}gönderildi: ${ok.map(s=>s.o.daire).join(", ")}`, "makbuz_send");
+    await b.commit();
+  }
+  hatalar.push(...sonuc.filter(s=>s.durum==="hata").map(s=>`${s.o.daire}: ${s.mesaj}`));
+  return { ok, hatalar, onizleme };
+}
+
+function gonderimOzeti({ ok, hatalar, onizleme }) {
+  return [
+    onizleme ? "ÖNİZLEME MODU: Gmail ayarı olmadığı için e-posta gönderilmedi, makbuzlar dosyaya kaydedildi." : "",
+    ok.length ? `✓ ${ok.length} makbuz gönderildi: ${ok.map(s=>`${s.o.daire} → ${s.email}`).join(", ")}` : "",
+    hatalar.length ? `✕ Gönderilemeyen:\n${hatalar.join("\n")}` : "",
+  ].filter(Boolean).join("\n\n");
+}
+
+// Tüm koleksiyonları tek JSON dosyası olarak indirir (kurallar / taşıma öncesi yedek)
+const YEDEK_KOLEKSIYONLAR = ["ayarlar","daireler","odemeler","gelirler","giderler","borclar","makbuzlar","auditLog"];
+async function yedekIndir() {
+  const duz = v => v && typeof v.toDate === "function" ? v.toDate().toISOString()
+    : Array.isArray(v) ? v.map(duz)
+    : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, duz(x)])) : v;
+  const veri = { proje:"ays105", alindi:new Date().toISOString() };
+  for (const ad of YEDEK_KOLEKSIYONLAR) {
+    veri[ad] = (await getDocs(collection(db, ad))).docs.map(x => ({ id:x.id, ...duz(x.data()) }));
+  }
+  const url = URL.createObjectURL(new Blob([JSON.stringify(veri, null, 2)], { type:"application/json" }));
+  const a = Object.assign(document.createElement("a"), { href:url, download:`ays105-yedek-${bugun()}.json` });
+  a.click();
+  URL.revokeObjectURL(url);
+  return YEDEK_KOLEKSIYONLAR.map(ad => `${ad}: ${veri[ad].length}`).join(", ");
 }
 
 function Topbar({title,sub,onCikis}) {
